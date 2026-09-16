@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from django.db.models import Count, Q
 
 from rest_framework import status, viewsets
@@ -5,10 +7,12 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django.utils import timezone
+from rest_framework.exceptions import PermissionDenied
 
 from accounts.access import get_user_scope
 
 from django.core.exceptions import ValidationError
+
 
 from .services.transactions import (
     release_inventory,
@@ -20,8 +24,22 @@ from .services.transactions import (
     discard_blood,
     request_transfer,
     approve_transfer,
+    reject_transfer,
     dispatch_transfer,
     receive_transfer,
+)
+
+from .services.transfer_notifications import (
+    transfer_requested_notification,
+    transfer_approved_notification,
+    transfer_dispatched_notification,
+    transfer_received_notification,
+)
+
+from .services.transfers import (
+    get_transfer_recommendations,
+    get_transfer_opportunity,
+    request_transfer_from_recommendation,
 )
 
 from facilities.models import Facility
@@ -34,6 +52,7 @@ from .models import (
     BloodTransfer,
     InventoryMovement,
     BloodStockAlert,
+    BloodRequest,
 )
 
 from .serializers import (
@@ -45,6 +64,7 @@ from .serializers import (
     InventoryMovementSerializer,
     InventoryTraceabilitySerializer,
     BloodStockAlertSerializer,
+    BloodRequestSerializer,
 )
 
 from .services.alerts import (
@@ -1021,6 +1041,351 @@ class InventoryRecordViewSet(
     @action(
         detail=False,
         methods=["get"],
+        url_path="transfer-recommendations",
+    )
+    def transfer_recommendations(self, request):
+        """
+        Return ranked blood transfer recommendations.
+
+        National users can see recommendations across
+        all facilities.
+
+        Facility users only see recommendations involving
+        their own facility.
+        """
+
+        user = request.user
+        scope = get_user_scope(user)
+
+        recommendations = get_transfer_recommendations()
+
+        # -------------------------------------------------
+        # FACILITY SCOPE
+        # -------------------------------------------------
+
+        if scope != "national":
+
+            if not user.facility_id:
+                return Response(
+                    {
+                        "detail": (
+                            "User is not assigned "
+                            "to a facility."
+                        )
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            facility_id = user.facility_id
+
+            recommendations = [
+                item
+                for item in recommendations
+                if (
+                    item["source_facility_id"]
+                    == facility_id
+                    or
+                    item["destination_facility_id"]
+                    == facility_id
+                )
+            ]
+
+        return Response(
+            {
+                "count": len(recommendations),
+                "recommendations": recommendations,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="transfer-opportunity",
+    )
+    def transfer_opportunity(self, request):
+        """
+        Return detailed information for one transfer opportunity.
+
+        Required query parameters:
+
+            source_facility_id
+            destination_facility_id
+            blood_group
+            component_type
+        """
+
+        source_facility_id = request.query_params.get(
+            "source_facility_id"
+        )
+
+        destination_facility_id = request.query_params.get(
+            "destination_facility_id"
+        )
+
+        blood_group = request.query_params.get(
+            "blood_group"
+        )
+
+        component_type = request.query_params.get(
+            "component_type"
+        )
+
+        # -------------------------------------------------
+        # VALIDATE PARAMETERS
+        # -------------------------------------------------
+
+        missing = []
+
+        if not source_facility_id:
+            missing.append("source_facility_id")
+
+        if not destination_facility_id:
+            missing.append("destination_facility_id")
+
+        if not blood_group:
+            missing.append("blood_group")
+
+        if not component_type:
+            missing.append("component_type")
+
+        if missing:
+
+            return Response(
+                {
+                    "detail": (
+                        "Missing required parameters."
+                    ),
+                    "required": missing,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # -------------------------------------------------
+        # CONVERT FACILITY IDS
+        # -------------------------------------------------
+
+        try:
+
+            source_facility_id = int(
+                source_facility_id
+            )
+
+            destination_facility_id = int(
+                destination_facility_id
+            )
+
+        except (TypeError, ValueError):
+
+            return Response(
+                {
+                    "detail": (
+                        "Facility IDs must be valid integers."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # -------------------------------------------------
+        # FACILITY SCOPE
+        # -------------------------------------------------
+
+        user = request.user
+        scope = get_user_scope(user)
+
+        if scope != "national":
+
+            if not user.facility_id:
+
+                return Response(
+                    {
+                        "detail": (
+                            "User is not assigned "
+                            "to a facility."
+                        )
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            if (
+                source_facility_id
+                != user.facility_id
+                and
+                destination_facility_id
+                != user.facility_id
+            ):
+
+                return Response(
+                    {
+                        "detail": (
+                            "You can only view transfer "
+                            "opportunities involving "
+                            "your facility."
+                        )
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        # -------------------------------------------------
+        # SAME FACILITY PROTECTION
+        # -------------------------------------------------
+
+        if (
+            source_facility_id
+            == destination_facility_id
+        ):
+
+            return Response(
+                {
+                    "detail": (
+                        "Source and destination facilities "
+                        "must be different."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # -------------------------------------------------
+        # CHECK FACILITIES EXIST
+        # -------------------------------------------------
+
+        source_facility = Facility.objects.filter(
+            pk=source_facility_id
+        ).first()
+
+        destination_facility = Facility.objects.filter(
+            pk=destination_facility_id
+        ).first()
+
+        if source_facility is None:
+
+            return Response(
+                {
+                    "detail": (
+                        "Source facility was not found."
+                    )
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if destination_facility is None:
+
+            return Response(
+                {
+                    "detail": (
+                        "Destination facility was not found."
+                    )
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # -------------------------------------------------
+        # GET OPPORTUNITY
+        # -------------------------------------------------
+
+        opportunity = get_transfer_opportunity(
+            source_facility_id=source_facility_id,
+            destination_facility_id=(
+                destination_facility_id
+            ),
+            blood_group=blood_group,
+            component_type=component_type,
+        )
+
+        if opportunity is None:
+
+            return Response(
+                {
+                    "detail": (
+                        "No active transfer opportunity "
+                        "matches the supplied criteria."
+                    ),
+
+                    "source_facility": {
+                        "id": source_facility.id,
+                        "name": source_facility.name,
+                    },
+
+                    "destination_facility": {
+                        "id": destination_facility.id,
+                        "name": destination_facility.name,
+                    },
+
+                    "blood_group": blood_group,
+                    "component_type": component_type,
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # -------------------------------------------------
+        # DETAILED RESPONSE
+        # -------------------------------------------------
+
+        response_data = {
+            "opportunity": opportunity,
+
+            "source": {
+                "facility_id": source_facility.id,
+                "facility_name": source_facility.name,
+                "available_units": (
+                    opportunity[
+                        "source_available_units"
+                    ]
+                ),
+                "transferable_units": (
+                    opportunity[
+                        "source_transferable_units"
+                    ]
+                ),
+            },
+
+            "destination": {
+                "facility_id": destination_facility.id,
+                "facility_name": destination_facility.name,
+                "available_units": (
+                    opportunity[
+                        "destination_available_units"
+                    ]
+                ),
+            },
+
+            "blood": {
+                "blood_group": (
+                    opportunity["blood_group"]
+                ),
+                "component_type": (
+                    opportunity["component_type"]
+                ),
+            },
+
+            "recommendation": {
+                "recommended_units": (
+                    opportunity[
+                        "recommended_units"
+                    ]
+                ),
+                "shortage_level": (
+                    opportunity["shortage_level"]
+                ),
+                "priority": (
+                    opportunity["priority"]
+                ),
+            },
+
+            "action": {
+                "can_request_transfer": True,
+                "creates_transfer": False,
+            },
+        }
+
+        return Response(
+            response_data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
         url_path="facility-comparison",
     )
     def facility_comparison(self, request):
@@ -1371,6 +1736,762 @@ class InventoryRecordViewSet(
                 "facility_comparison": facility_data,
             },
 
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="transfer-opportunities",
+    )
+    def transfer_opportunities(self, request):
+
+        user = request.user
+        scope = get_user_scope(user)
+
+        # -------------------------------------------------
+        # NATIONAL ACCESS ONLY
+        # -------------------------------------------------
+        if scope != "national":
+            return Response(
+                {
+                    "detail": (
+                        "National transfer opportunity "
+                        "access is restricted to national users."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # -------------------------------------------------
+        # GET ALL FACILITIES
+        # -------------------------------------------------
+        facilities = Facility.objects.all().order_by(
+            "name"
+        )
+
+        # -------------------------------------------------
+        # GET ALL BLOOD GROUP / COMPONENT COMBINATIONS
+        # -------------------------------------------------
+        combinations = (
+            InventoryRecord.objects
+            .values(
+                "blood_unit__blood_group",
+                "blood_unit__component_type",
+            )
+            .distinct()
+            .order_by(
+                "blood_unit__blood_group",
+                "blood_unit__component_type",
+            )
+        )
+
+        # -------------------------------------------------
+        # STOCK DATA
+        # -------------------------------------------------
+        stock = (
+            InventoryRecord.objects
+            .filter(
+                status=InventoryRecord.Status.AVAILABLE
+            )
+            .values(
+                "facility_id",
+                "facility__name",
+                "blood_unit__blood_group",
+                "blood_unit__component_type",
+            )
+            .annotate(
+                units=Count("id")
+            )
+        )
+
+        stock_map = {
+            (
+                item["facility_id"],
+                item["blood_unit__blood_group"],
+                item["blood_unit__component_type"],
+            ): item["units"]
+            for item in stock
+        }
+
+        # -------------------------------------------------
+        # BUILD OPPORTUNITIES
+        # -------------------------------------------------
+        opportunities = []
+
+        SURPLUS_THRESHOLD = 5
+        CRITICAL_THRESHOLD = 2
+
+        for combination in combinations:
+
+            blood_group = combination[
+                "blood_unit__blood_group"
+            ]
+
+            component_type = combination[
+                "blood_unit__component_type"
+            ]
+
+            facility_stock = []
+
+            for facility in facilities:
+
+                units = stock_map.get(
+                    (
+                        facility.id,
+                        blood_group,
+                        component_type,
+                    ),
+                    0,
+                )
+
+                facility_stock.append(
+                    {
+                        "facility_id": facility.id,
+                        "facility_name": facility.name,
+                        "available_units": units,
+                    }
+                )
+
+            # -------------------------------------------------
+            # IDENTIFY SURPLUS FACILITIES
+            # -------------------------------------------------
+            surplus_facilities = [
+                item
+                for item in facility_stock
+                if item["available_units"]
+                > SURPLUS_THRESHOLD
+            ]
+
+            # -------------------------------------------------
+            # IDENTIFY SHORTAGE FACILITIES
+            # -------------------------------------------------
+            shortage_facilities = [
+                item
+                for item in facility_stock
+                if item["available_units"]
+                <= SURPLUS_THRESHOLD
+            ]
+
+            # -------------------------------------------------
+            # CREATE TRANSFER OPPORTUNITIES
+            # -------------------------------------------------
+            for destination in shortage_facilities:
+
+                destination_units = destination[
+                    "available_units"
+                ]
+
+                if destination_units == 0:
+                    priority = "URGENT"
+
+                elif destination_units <= CRITICAL_THRESHOLD:
+                    priority = "HIGH"
+
+                else:
+                    priority = "NORMAL"
+
+                for source in surplus_facilities:
+
+                    source_units = source[
+                        "available_units"
+                    ]
+
+                    # Keep at least the surplus threshold
+                    # at the source facility.
+                    transferable_units = (
+                        source_units
+                        - SURPLUS_THRESHOLD
+                    )
+
+                    if transferable_units <= 0:
+                        continue
+
+                    # Suggested quantity should restore
+                    # destination stock to the surplus level.
+                    required_units = (
+                        SURPLUS_THRESHOLD
+                        - destination_units
+                    )
+
+                    suggested_quantity = min(
+                        transferable_units,
+                        max(required_units, 1),
+                    )
+
+                    opportunities.append(
+                        {
+                            "blood_group": blood_group,
+                            "component_type": component_type,
+
+                            "source": {
+                                "facility_id": (
+                                    source["facility_id"]
+                                ),
+                                "facility_name": (
+                                    source["facility_name"]
+                                ),
+                                "available_units": (
+                                    source_units
+                                ),
+                            },
+
+                            "destination": {
+                                "facility_id": (
+                                    destination[
+                                        "facility_id"
+                                    ]
+                                ),
+                                "facility_name": (
+                                    destination[
+                                        "facility_name"
+                                    ]
+                                ),
+                                "available_units": (
+                                    destination_units
+                                ),
+                            },
+
+                            "suggested_quantity": (
+                                suggested_quantity
+                            ),
+
+                            "priority": priority,
+                        }
+                    )
+
+        # -------------------------------------------------
+        # PRIORITY ORDER
+        # -------------------------------------------------
+        priority_order = {
+            "URGENT": 0,
+            "HIGH": 1,
+            "NORMAL": 2,
+        }
+
+        opportunities.sort(
+            key=lambda item: (
+                priority_order.get(
+                    item["priority"],
+                    99,
+                ),
+                item["blood_group"],
+                item["component_type"],
+                item["destination"][
+                    "facility_name"
+                ],
+                item["source"][
+                    "facility_name"
+                ],
+            )
+        )
+
+        # -------------------------------------------------
+        # SUMMARY
+        # -------------------------------------------------
+        summary = {
+            "total_opportunities": len(
+                opportunities
+            ),
+
+            "urgent": sum(
+                1
+                for item in opportunities
+                if item["priority"] == "URGENT"
+            ),
+
+            "high": sum(
+                1
+                for item in opportunities
+                if item["priority"] == "HIGH"
+            ),
+
+            "normal": sum(
+                1
+                for item in opportunities
+                if item["priority"] == "NORMAL"
+            ),
+        }
+
+        return Response(
+            {
+                "scope": "national",
+
+                "summary": summary,
+
+                "opportunities": opportunities,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="request-transfer-from-recommendation",
+    )
+    def request_transfer_from_recommendation(
+        self,
+        request,
+    ):
+        """
+        Create transfer requests from a validated
+        transfer recommendation.
+        """
+
+        user = request.user
+        scope = get_user_scope(user)
+
+        # -------------------------------------------------
+        # REQUEST DATA
+        # -------------------------------------------------
+
+        source_facility_id = request.data.get(
+            "source_facility_id"
+        )
+
+        destination_facility_id = request.data.get(
+            "destination_facility_id"
+        )
+
+        blood_group = request.data.get(
+            "blood_group"
+        )
+
+        component_type = request.data.get(
+            "component_type"
+        )
+
+        requested_units = request.data.get(
+            "requested_units"
+        )
+
+        reason = request.data.get(
+            "reason",
+            "",
+        )
+
+        notes = request.data.get(
+            "notes",
+            "",
+        )
+
+        # -------------------------------------------------
+        # REQUIRED FIELDS
+        # -------------------------------------------------
+
+        missing = []
+
+        if not source_facility_id:
+            missing.append(
+                "source_facility_id"
+            )
+
+        if not destination_facility_id:
+            missing.append(
+                "destination_facility_id"
+            )
+
+        if not blood_group:
+            missing.append(
+                "blood_group"
+            )
+
+        if not component_type:
+            missing.append(
+                "component_type"
+            )
+
+        if requested_units in [
+            None,
+            "",
+        ]:
+            missing.append(
+                "requested_units"
+            )
+
+        if missing:
+
+            return Response(
+                {
+                    "detail": (
+                        "Missing required fields."
+                    ),
+                    "required": missing,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # -------------------------------------------------
+        # VALIDATE IDS
+        # -------------------------------------------------
+
+        try:
+
+            source_facility_id = int(
+                source_facility_id
+            )
+
+            destination_facility_id = int(
+                destination_facility_id
+            )
+
+            requested_units = int(
+                requested_units
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            return Response(
+                {
+                    "detail": (
+                        "Facility IDs and requested_units "
+                        "must be valid integers."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # -------------------------------------------------
+        # SAME FACILITY PROTECTION
+        # -------------------------------------------------
+
+        if (
+            source_facility_id
+            == destination_facility_id
+        ):
+
+            return Response(
+                {
+                    "detail": (
+                        "Source and destination facilities "
+                        "must be different."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # -------------------------------------------------
+        # FACILITY ACCESS CONTROL
+        # -------------------------------------------------
+
+        if scope != "national":
+
+            if not user.facility_id:
+
+                return Response(
+                    {
+                        "detail": (
+                            "User is not assigned "
+                            "to a facility."
+                        )
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            if (
+                source_facility_id
+                != user.facility_id
+            ):
+
+                return Response(
+                    {
+                        "detail": (
+                            "You can only request blood "
+                            "from your own facility."
+                        )
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        # -------------------------------------------------
+        # CREATE REQUESTS
+        # -------------------------------------------------
+
+        try:
+
+            transfers = (
+                request_transfer_from_recommendation(
+                    source_facility_id=(
+                        source_facility_id
+                    ),
+                    destination_facility_id=(
+                        destination_facility_id
+                    ),
+                    blood_group=blood_group,
+                    component_type=component_type,
+                    requested_units=requested_units,
+                    requested_by=user,
+                    reason=reason,
+                    notes=notes,
+                )
+            )
+
+        except ValidationError as exc:
+
+            return Response(
+                {
+                    "detail": exc.detail,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # -------------------------------------------------
+        # RESPONSE
+        # -------------------------------------------------
+
+        return Response(
+            {
+                "detail": (
+                    "Transfer request created successfully."
+                ),
+
+                "count": len(transfers),
+
+                "status": (
+                    BloodTransfer.Status.REQUESTED
+                ),
+
+                "source_facility_id": (
+                    source_facility_id
+                ),
+
+                "destination_facility_id": (
+                    destination_facility_id
+                ),
+
+                "blood_group": blood_group,
+
+                "component_type": component_type,
+
+                "requested_units": requested_units,
+
+                "transfers": [
+                    {
+                        "id": transfer.id,
+                        "transfer_id": (
+                            transfer.transfer_id
+                        ),
+                        "blood_unit_id": (
+                            transfer.blood_unit_id
+                        ),
+                        "status": transfer.status,
+                    }
+                    for transfer in transfers
+                ],
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="national-heatmap",
+    )
+    def national_heatmap(self, request):
+
+        user = request.user
+        scope = get_user_scope(user)
+
+        # -------------------------------------------------
+        # NATIONAL ACCESS ONLY
+        # -------------------------------------------------
+        if scope != "national":
+            return Response(
+                {
+                    "detail": (
+                        "National inventory access "
+                        "is restricted to national users."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # -------------------------------------------------
+        # GET ALL FACILITIES
+        # -------------------------------------------------
+        facilities = (
+            Facility.objects
+            .all()
+            .order_by("name")
+        )
+
+        # -------------------------------------------------
+        # GET ALL BLOOD GROUP / COMPONENT COMBINATIONS
+        # -------------------------------------------------
+        combinations = (
+            InventoryRecord.objects
+            .values(
+                "blood_unit__blood_group",
+                "blood_unit__component_type",
+            )
+            .distinct()
+            .order_by(
+                "blood_unit__blood_group",
+                "blood_unit__component_type",
+            )
+        )
+
+        combinations = [
+            {
+                "blood_group": item[
+                    "blood_unit__blood_group"
+                ],
+                "component_type": item[
+                    "blood_unit__component_type"
+                ],
+            }
+            for item in combinations
+        ]
+
+        # -------------------------------------------------
+        # AVAILABLE STOCK
+        # -------------------------------------------------
+        stock = (
+            InventoryRecord.objects
+            .filter(
+                status=InventoryRecord.Status.AVAILABLE
+            )
+            .values(
+                "facility_id",
+                "blood_unit__blood_group",
+                "blood_unit__component_type",
+            )
+            .annotate(
+                units=Count("id")
+            )
+        )
+
+        # -------------------------------------------------
+        # CREATE FAST LOOKUP MAP
+        # -------------------------------------------------
+        stock_map = {
+            (
+                item["facility_id"],
+                item["blood_unit__blood_group"],
+                item["blood_unit__component_type"],
+            ): item["units"]
+            for item in stock
+        }
+
+        # -------------------------------------------------
+        # BUILD HEATMAP
+        # -------------------------------------------------
+        heatmap = []
+
+        for facility in facilities:
+
+            facility_rows = []
+
+            for combination in combinations:
+
+                blood_group = combination["blood_group"]
+                component_type = combination[
+                    "component_type"
+                ]
+
+                units = stock_map.get(
+                    (
+                        facility.id,
+                        blood_group,
+                        component_type,
+                    ),
+                    0,
+                )
+
+                # -----------------------------------------
+                # AVAILABILITY LEVEL
+                # -----------------------------------------
+                if units == 0:
+                    availability = "ZERO"
+
+                elif units <= 2:
+                    availability = "CRITICAL"
+
+                elif units <= 5:
+                    availability = "LOW"
+
+                else:
+                    availability = "NORMAL"
+
+                facility_rows.append(
+                    {
+                        "blood_group": blood_group,
+                        "component_type": component_type,
+                        "units": units,
+                        "availability": availability,
+                    }
+                )
+
+            heatmap.append(
+                {
+                    "facility_id": facility.id,
+                    "facility_name": facility.name,
+                    "stock": facility_rows,
+                }
+            )
+
+        # -------------------------------------------------
+        # NATIONAL TOTALS BY BLOOD GROUP / COMPONENT
+        # -------------------------------------------------
+        national_matrix = []
+
+        for combination in combinations:
+
+            blood_group = combination["blood_group"]
+            component_type = combination[
+                "component_type"
+            ]
+
+            total_units = sum(
+                stock_map.get(
+                    (
+                        facility.id,
+                        blood_group,
+                        component_type,
+                    ),
+                    0,
+                )
+                for facility in facilities
+            )
+
+            if total_units == 0:
+                availability = "ZERO"
+
+            elif total_units <= 2:
+                availability = "CRITICAL"
+
+            elif total_units <= 5:
+                availability = "LOW"
+
+            else:
+                availability = "NORMAL"
+
+            national_matrix.append(
+                {
+                    "blood_group": blood_group,
+                    "component_type": component_type,
+                    "units": total_units,
+                    "availability": availability,
+                }
+            )
+
+        return Response(
+            {
+                "scope": "national",
+
+                "thresholds": {
+                    "zero": 0,
+                    "critical": 2,
+                    "low": 5,
+                },
+
+                "facilities": heatmap,
+
+                "national_matrix": national_matrix,
+            },
             status=status.HTTP_200_OK,
         )
 
@@ -1755,11 +2876,13 @@ class BloodReservationViewSet(
 
 class BloodIssueViewSet(
     InventoryScopedMixin,
-    viewsets.ReadOnlyModelViewSet,
+    viewsets.ModelViewSet,
 ):
 
     queryset = BloodIssue.objects.select_related(
         "inventory",
+        "inventory__blood_unit",
+        "inventory__storage_location",
         "facility",
         "issued_by",
     ).all()
@@ -1767,9 +2890,70 @@ class BloodIssueViewSet(
     serializer_class = BloodIssueSerializer
     permission_classes = [IsAuthenticated]
 
+    http_method_names = [
+        "get",
+        "post",
+        "head",
+        "options",
+    ]
+
     def get_queryset(self):
         return self.scoped_queryset(
             super().get_queryset()
+        )
+
+    def create(
+        self,
+        request,
+        *args,
+        **kwargs,
+    ):
+        user = request.user
+
+        if not user.facility_id:
+            from rest_framework.exceptions import (
+                PermissionDenied
+            )
+
+            raise PermissionDenied(
+                "User is not assigned to a facility."
+            )
+
+        serializer = self.get_serializer(
+            data=request.data
+        )
+
+        serializer.is_valid(
+            raise_exception=True
+        )
+
+        issue = issue_blood(
+            inventory_id=serializer.validated_data[
+                "inventory"
+            ].pk,
+            facility=user.facility,
+            issued_by=user,
+            patient_reference=serializer.validated_data.get(
+                "patient_reference",
+                "",
+            ),
+            clinical_reference=serializer.validated_data.get(
+                "clinical_reference",
+                "",
+            ),
+            notes=serializer.validated_data.get(
+                "notes",
+                "",
+            ),
+        )
+
+        output_serializer = self.get_serializer(
+            issue
+        )
+
+        return Response(
+            output_serializer.data,
+            status=status.HTTP_201_CREATED,
         )
 
     @action(
@@ -1834,24 +3018,6 @@ class BloodIssueViewSet(
             status=status.HTTP_200_OK,
         )
 
-    def perform_create(self, serializer):
-
-        user = self.request.user
-
-        if not user.facility_id:
-            from rest_framework.exceptions import (
-                PermissionDenied
-            )
-
-            raise PermissionDenied(
-                "User is not assigned to a facility."
-            )
-
-        serializer.save(
-            facility=user.facility,
-            issued_by=user,
-        )
-
 
 class BloodTransferViewSet(
     InventoryScopedMixin,
@@ -1862,6 +3028,10 @@ class BloodTransferViewSet(
         "from_facility",
         "to_facility",
         "requested_by",
+        "approved_by",
+        "rejected_by",
+        "dispatched_by",
+        "received_by",
     ).all()
 
     serializer_class = BloodTransferSerializer
@@ -1874,15 +3044,121 @@ class BloodTransferViewSet(
         scope = get_user_scope(user)
 
         if scope == "national":
-            return queryset
+            pass
+        else:
+            if not user.facility_id:
+                return queryset.none()
 
-        if not user.facility_id:
-            return queryset.none()
+            queryset = queryset.filter(
+                Q(
+                    from_facility_id=user.facility_id
+                )
+                |
+                Q(
+                    to_facility_id=user.facility_id
+                )
+            )
 
-        return queryset.filter(
-            from_facility_id=user.facility_id
-        ) | queryset.filter(
-            to_facility_id=user.facility_id
+        params = self.request.query_params
+
+        transfer_status = params.get("status")
+        source = params.get("from_facility")
+        destination = params.get("to_facility")
+        blood_group = params.get("blood_group")
+        component = params.get("component_type")
+
+        if transfer_status:
+            queryset = queryset.filter(
+                status=transfer_status
+            )
+
+        if source:
+            queryset = queryset.filter(
+                from_facility_id=source
+            )
+
+        if destination:
+            queryset = queryset.filter(
+                to_facility_id=destination
+            )
+
+        if blood_group:
+            queryset = queryset.filter(
+                blood_unit__blood_group=blood_group
+            )
+
+        if component:
+            queryset = queryset.filter(
+                blood_unit__component_type=component
+            )
+
+        return queryset.order_by(
+            "-requested_at"
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="dashboard",
+    )
+    def dashboard(self, request):
+
+        queryset = self.get_queryset()
+
+        now = timezone.now()
+
+        requested = queryset.filter(
+            status=BloodTransfer.Status.REQUESTED
+        ).count()
+
+        approved = queryset.filter(
+            status=BloodTransfer.Status.APPROVED
+        ).count()
+
+        dispatched = queryset.filter(
+            status=BloodTransfer.Status.DISPATCHED
+        ).count()
+
+        received = queryset.filter(
+            status=BloodTransfer.Status.RECEIVED
+        ).count()
+
+        cancelled = queryset.filter(
+            status=BloodTransfer.Status.CANCELLED
+        ).count()
+
+        aging_threshold = now - timedelta(hours=24)
+
+        aging = queryset.filter(
+            status__in=[
+                BloodTransfer.Status.REQUESTED,
+                BloodTransfer.Status.APPROVED,
+                BloodTransfer.Status.DISPATCHED,
+            ]
+        ).filter(
+            requested_at__lte=aging_threshold
+        ).count()
+
+        return Response(
+            {
+                "summary": {
+                    "requested": requested,
+                    "approved": approved,
+                    "dispatched": dispatched,
+                    "in_transit": dispatched,
+                    "received": received,
+                    "cancelled": cancelled,
+                    "aging": aging,
+                },
+                "status_distribution": {
+                    "requested": requested,
+                    "approved": approved,
+                    "dispatched": dispatched,
+                    "received": received,
+                    "cancelled": cancelled,
+                },
+            },
+            status=status.HTTP_200_OK,
         )
 
     @action(
@@ -1967,6 +3243,8 @@ class BloodTransferViewSet(
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        transfer_requested_notification(transfer)
+
         serializer = self.get_serializer(
             transfer
         )
@@ -1983,32 +3261,119 @@ class BloodTransferViewSet(
     )
     def approve(self, request, pk=None):
 
-        try:
-            transfer = approve_transfer(
-                transfer_id=pk,
-                approved_by=request.user,
-            )
+        transfer = self.get_object()
 
-        except BloodTransfer.DoesNotExist:
+        user = request.user
+        scope = get_user_scope(user)
+
+        if scope != "national":
             return Response(
                 {
-                    "detail": "Transfer not found."
+                    "detail": (
+                        "Only national users can approve "
+                        "blood transfers."
+                    )
                 },
-                status=status.HTTP_404_NOT_FOUND,
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            transfer = approve_transfer(
+                transfer_id=transfer.id,
+                approved_by=user,
             )
 
         except ValidationError as exc:
             return Response(
                 {
-                    "detail": str(exc)
+                    "detail": str(exc.detail)
+                    if hasattr(exc, "detail")
+                    else str(exc)
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        transfer_approved_notification(transfer)
+
         return Response(
-            self.get_serializer(
-                transfer
-            ).data,
+            {
+                "detail": "Transfer approved successfully.",
+                "transfer_id": transfer.transfer_id,
+                "status": transfer.status,
+                "approved_by": user.id,
+                "approved_at": transfer.approved_at,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="reject",
+    )
+    def reject(self, request, pk=None):
+
+        transfer = self.get_object()
+
+        user = request.user
+        scope = get_user_scope(user)
+
+        if scope != "national":
+            return Response(
+                {
+                    "detail": (
+                        "Only national users can reject "
+                        "blood transfers."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        reason = request.data.get(
+            "reason",
+            "",
+        ).strip()
+
+        if not reason:
+            return Response(
+                {
+                    "detail": (
+                        "A rejection reason is required."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            transfer = reject_transfer(
+                transfer_id=transfer.id,
+                rejected_by=user,
+                reason=reason,
+            )
+
+        except ValidationError as exc:
+            return Response(
+                {
+                    "detail": str(exc.detail)
+                    if hasattr(exc, "detail")
+                    else str(exc)
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        transfer_dispatched_notification(transfer)
+
+        return Response(
+            {
+                "detail": "Transfer rejected successfully.",
+                "transfer_id": transfer.transfer_id,
+                "status": transfer.status,
+                "rejected_by": user.id,
+                "rejected_at": transfer.rejected_at,
+                "rejection_reason": (
+                    transfer.rejection_reason
+                ),
+            },
             status=status.HTTP_200_OK,
         )
 
@@ -2019,32 +3384,61 @@ class BloodTransferViewSet(
     )
     def dispatch(self, request, pk=None):
 
-        try:
-            transfer = dispatch_transfer(
-                transfer_id=pk,
-                dispatched_by=request.user,
-            )
+        transfer = self.get_object()
 
-        except BloodTransfer.DoesNotExist:
+        user = request.user
+        scope = get_user_scope(user)
+
+        if scope != "national":
             return Response(
                 {
-                    "detail": "Transfer not found."
+                    "detail": (
+                        "Only national users can dispatch "
+                        "blood transfers."
+                    )
                 },
-                status=status.HTTP_404_NOT_FOUND,
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            transfer = dispatch_transfer(
+                transfer_id=transfer.id,
+                dispatched_by=user,
             )
 
         except ValidationError as exc:
             return Response(
                 {
-                    "detail": str(exc)
+                    "detail": (
+                        str(exc.detail)
+                        if hasattr(exc, "detail")
+                        else str(exc)
+                    )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         return Response(
-            self.get_serializer(
-                transfer
-            ).data,
+            {
+                "detail": (
+                    "Blood transfer dispatched successfully."
+                ),
+                "transfer_id": transfer.transfer_id,
+                "status": transfer.status,
+                "from_facility": (
+                    transfer.from_facility.name
+                ),
+                "to_facility": (
+                    transfer.to_facility.name
+                ),
+                "blood_group": (
+                    transfer.blood_unit.blood_group
+                ),
+                "component_type": (
+                    transfer.blood_unit.component_type
+                ),
+                "dispatched_at": transfer.dispatched_at,
+            },
             status=status.HTTP_200_OK,
         )
 
@@ -2111,10 +3505,280 @@ class BloodTransferViewSet(
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        transfer_received_notification(transfer)
+
         return Response(
             self.get_serializer(
                 transfer
             ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="history",
+    )
+    def history(self, request, pk=None):
+
+        transfer = self.get_object()
+
+        inventory = (
+            InventoryRecord.objects
+            .select_related(
+                "blood_unit",
+                "facility",
+                "storage_location",
+            )
+            .get(
+                blood_unit=transfer.blood_unit
+            )
+        )
+
+        movements = (
+            InventoryMovement.objects
+            .filter(inventory=inventory)
+            .select_related(
+                "created_by",
+                "from_location",
+                "to_location",
+            )
+            .order_by("created_at")
+        )
+
+        timeline = []
+
+        timeline.append(
+            {
+                "event": "REQUESTED",
+                "timestamp": transfer.requested_at,
+                "user": (
+                    transfer.requested_by.id
+                    if transfer.requested_by
+                    else None
+                ),
+            }
+        )
+
+        if transfer.approved_at:
+            timeline.append(
+                {
+                    "event": "APPROVED",
+                    "timestamp": transfer.approved_at,
+                    "user": (
+                        transfer.approved_by.id
+                        if transfer.approved_by
+                        else None
+                    ),
+                }
+            )
+
+        if transfer.rejected_at:
+            timeline.append(
+                {
+                    "event": "REJECTED",
+                    "timestamp": transfer.rejected_at,
+                    "user": (
+                        transfer.rejected_by.id
+                        if transfer.rejected_by
+                        else None
+                    ),
+                    "reason": transfer.rejection_reason,
+                }
+            )
+
+        if transfer.dispatched_at:
+            timeline.append(
+                {
+                    "event": "DISPATCHED",
+                    "timestamp": transfer.dispatched_at,
+                    "user": (
+                        transfer.dispatched_by.id
+                        if transfer.dispatched_by
+                        else None
+                    ),
+                }
+            )
+
+        if transfer.received_at:
+            timeline.append(
+                {
+                    "event": "RECEIVED",
+                    "timestamp": transfer.received_at,
+                    "user": (
+                        transfer.received_by.id
+                        if transfer.received_by
+                        else None
+                    ),
+                }
+            )
+
+        return Response(
+            {
+                "transfer": {
+                    "transfer_id": transfer.transfer_id,
+                    "status": transfer.status,
+                    "blood_unit": transfer.blood_unit.unit_id,
+                    "blood_group": transfer.blood_unit.blood_group,
+                    "component_type": (
+                        transfer.blood_unit.component_type
+                    ),
+                    "from_facility": (
+                        transfer.from_facility.name
+                    ),
+                    "to_facility": (
+                        transfer.to_facility.name
+                    ),
+                },
+                "timeline": timeline,
+                "inventory_movements": [
+                    {
+                        "movement_type": movement.movement_type,
+                        "reason": movement.reason,
+                        "timestamp": movement.created_at,
+                        "created_by": (
+                            movement.created_by.id
+                            if movement.created_by
+                            else None
+                        ),
+                        "from_location": (
+                            movement.from_location.name
+                            if movement.from_location
+                            else None
+                        ),
+                        "to_location": (
+                            movement.to_location.name
+                            if movement.to_location
+                            else None
+                        ),
+                    }
+                    for movement in movements
+                ],
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="national-logistics",
+    )
+    def national_logistics(self, request):
+
+        user = request.user
+
+        if get_user_scope(user) != "national":
+            return Response(
+                {
+                    "detail": (
+                        "National logistics access "
+                        "is restricted to national users."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        transfers = self.get_queryset()
+
+        now = timezone.now()
+
+        requested = transfers.filter(
+            status=BloodTransfer.Status.REQUESTED
+        )
+
+        approved = transfers.filter(
+            status=BloodTransfer.Status.APPROVED
+        )
+
+        in_transit = transfers.filter(
+            status=BloodTransfer.Status.DISPATCHED
+        )
+
+        received = transfers.filter(
+            status=BloodTransfer.Status.RECEIVED
+        )
+
+        cancelled = transfers.filter(
+            status=BloodTransfer.Status.CANCELLED
+        )
+
+        aging = transfers.filter(
+            status__in=[
+                BloodTransfer.Status.REQUESTED,
+                BloodTransfer.Status.APPROVED,
+                BloodTransfer.Status.DISPATCHED,
+            ],
+            requested_at__lte=(
+                now - timedelta(hours=24)
+            ),
+        )
+
+        return Response(
+            {
+                "summary": {
+                    "total_transfers": transfers.count(),
+                    "requested": requested.count(),
+                    "approved": approved.count(),
+                    "in_transit": in_transit.count(),
+                    "received": received.count(),
+                    "cancelled": cancelled.count(),
+                    "aging": aging.count(),
+                },
+                "in_transit": [
+                    {
+                        "transfer_id": transfer.transfer_id,
+                        "blood_unit": (
+                            transfer.blood_unit.unit_id
+                        ),
+                        "blood_group": (
+                            transfer.blood_unit.blood_group
+                        ),
+                        "component_type": (
+                            transfer.blood_unit.component_type
+                        ),
+                        "from_facility": (
+                            transfer.from_facility.name
+                        ),
+                        "to_facility": (
+                            transfer.to_facility.name
+                        ),
+                        "dispatched_at": (
+                            transfer.dispatched_at
+                        ),
+                    }
+                    for transfer in in_transit
+                ],
+                "aging_transfers": [
+                    {
+                        "transfer_id": transfer.transfer_id,
+                        "status": transfer.status,
+                        "from_facility": (
+                            transfer.from_facility.name
+                        ),
+                        "to_facility": (
+                            transfer.to_facility.name
+                        ),
+                        "blood_group": (
+                            transfer.blood_unit.blood_group
+                        ),
+                        "component_type": (
+                            transfer.blood_unit.component_type
+                        ),
+                        "requested_at": (
+                            transfer.requested_at
+                        ),
+                        "age_hours": round(
+                            (
+                                now -
+                                transfer.requested_at
+                            ).total_seconds()
+                            / 3600,
+                            1,
+                        ),
+                    }
+                    for transfer in aging
+                ],
+            },
             status=status.HTTP_200_OK,
         )
 
@@ -2472,5 +4136,311 @@ class BloodStockAlertViewSet(
 
         return Response(
             self.get_serializer(alert).data,
+            status=status.HTTP_200_OK,
+        )
+
+class BloodRequestViewSet(
+    InventoryScopedMixin,
+    viewsets.ModelViewSet,
+):
+
+    queryset = BloodRequest.objects.select_related(
+        "facility",
+        "requested_by",
+        "reviewed_by",
+    ).all()
+
+    serializer_class = BloodRequestSerializer
+    permission_classes = [IsAuthenticated]
+
+    http_method_names = [
+        "get",
+        "post",
+        "head",
+        "options",
+    ]
+
+    def get_queryset(self):
+
+        queryset = self.scoped_queryset(
+            super().get_queryset()
+        )
+
+        status_filter = self.request.query_params.get(
+            "status"
+        )
+
+        priority = self.request.query_params.get(
+            "priority"
+        )
+
+        blood_group = self.request.query_params.get(
+            "blood_group"
+        )
+
+        component_type = self.request.query_params.get(
+            "component_type"
+        )
+
+        facility = self.request.query_params.get(
+            "facility"
+        )
+
+        if status_filter:
+            queryset = queryset.filter(
+                status=status_filter
+            )
+
+        if priority:
+            queryset = queryset.filter(
+                priority=priority
+            )
+
+        if blood_group:
+            queryset = queryset.filter(
+                blood_group__iexact=blood_group
+            )
+
+        if component_type:
+            queryset = queryset.filter(
+                component_type__iexact=component_type
+            )
+
+        if facility:
+            queryset = queryset.filter(
+                facility_id=facility
+            )
+
+        return queryset.order_by(
+            "-created_at"
+        )
+
+    def perform_create(self, serializer):
+
+        user = self.request.user
+
+        if not user.facility_id:
+            raise PermissionDenied(
+                "User is not assigned to a facility."
+            )
+
+        serializer.save(
+            facility=user.facility,
+            requested_by=user,
+            status=BloodRequest.Status.PENDING,
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="review",
+    )
+    def review(
+        self,
+        request,
+        pk=None,
+    ):
+
+        blood_request = self.get_object()
+
+        if blood_request.status != (
+            BloodRequest.Status.PENDING
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "Only pending blood requests "
+                        "can be reviewed."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        blood_request.status = (
+            BloodRequest.Status.REVIEWED
+        )
+
+        blood_request.reviewed_by = request.user
+        blood_request.reviewed_at = timezone.now()
+
+        blood_request.save(
+            update_fields=[
+                "status",
+                "reviewed_by",
+                "reviewed_at",
+                "updated_at",
+            ]
+        )
+
+        return Response(
+            BloodRequestSerializer(
+                blood_request
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="fulfillment",
+    )
+    def fulfillment(
+        self,
+        request,
+        pk=None,
+    ):
+
+        from inventory.services.clinical import (
+            get_request_fulfillment,
+        )
+
+        blood_request = self.get_object()
+
+        result = get_request_fulfillment(
+            blood_request
+        )
+
+        result["units"] = [
+            {
+                "inventory_id": (
+                    inventory.inventory_id
+                ),
+                "unit_id": (
+                    inventory.blood_unit.unit_id
+                ),
+                "blood_group": (
+                    inventory.blood_unit.blood_group
+                ),
+                "component_type": (
+                    inventory.blood_unit.component_type
+                ),
+                "expiry_date": (
+                    inventory.blood_unit.expiry_date
+                ),
+                "storage_location": (
+                    inventory.storage_location.name
+                ),
+            }
+            for inventory in result["units"]
+        ]
+
+        return Response(
+            result,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="reject",
+    )
+    def reject(
+        self,
+        request,
+        pk=None,
+    ):
+
+        blood_request = self.get_object()
+
+        if blood_request.status not in [
+            BloodRequest.Status.PENDING,
+            BloodRequest.Status.REVIEWED,
+        ]:
+            return Response(
+                {
+                    "detail": (
+                        "This blood request "
+                        "cannot be rejected."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        reason = request.data.get(
+            "reason",
+            "",
+        )
+
+        if not reason:
+            return Response(
+                {
+                    "detail": (
+                        "A rejection reason is required."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        blood_request.status = (
+            BloodRequest.Status.REJECTED
+        )
+
+        blood_request.reviewed_by = request.user
+        blood_request.reviewed_at = timezone.now()
+        blood_request.notes = (
+            f"{blood_request.notes}\n"
+            f"Rejection reason: {reason}"
+        ).strip()
+
+        blood_request.save(
+            update_fields=[
+                "status",
+                "reviewed_by",
+                "reviewed_at",
+                "notes",
+                "updated_at",
+            ]
+        )
+
+        return Response(
+            BloodRequestSerializer(
+                blood_request
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="cancel",
+    )
+    def cancel(
+        self,
+        request,
+        pk=None,
+    ):
+
+        blood_request = self.get_object()
+
+        if blood_request.status in [
+            BloodRequest.Status.FULFILLED,
+            BloodRequest.Status.CANCELLED,
+            BloodRequest.Status.REJECTED,
+        ]:
+            return Response(
+                {
+                    "detail": (
+                        "This blood request "
+                        "cannot be cancelled."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        blood_request.status = (
+            BloodRequest.Status.CANCELLED
+        )
+
+        blood_request.save(
+            update_fields=[
+                "status",
+                "updated_at",
+            ]
+        )
+
+        return Response(
+            BloodRequestSerializer(
+                blood_request
+            ).data,
             status=status.HTTP_200_OK,
         )

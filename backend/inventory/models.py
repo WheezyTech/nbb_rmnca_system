@@ -199,6 +199,119 @@ class BloodReservation(models.Model):
     def __str__(self):
         return self.reservation_id
 
+class BloodRequest(models.Model):
+
+    class Priority(models.TextChoices):
+        ROUTINE = "ROUTINE", "Routine"
+        URGENT = "URGENT", "Urgent"
+        EMERGENCY = "EMERGENCY", "Emergency"
+
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        REVIEWED = "REVIEWED", "Reviewed"
+        PARTIALLY_FULFILLED = (
+            "PARTIALLY_FULFILLED",
+            "Partially Fulfilled",
+        )
+        FULFILLED = "FULFILLED", "Fulfilled"
+        CANCELLED = "CANCELLED", "Cancelled"
+        REJECTED = "REJECTED", "Rejected"
+
+    request_id = models.CharField(
+        max_length=60,
+        unique=True,
+        editable=False,
+    )
+
+    facility = models.ForeignKey(
+        "facilities.Facility",
+        on_delete=models.PROTECT,
+        related_name="blood_requests",
+    )
+
+    patient_reference = models.CharField(
+        max_length=100,
+    )
+
+    clinical_reference = models.CharField(
+        max_length=100,
+        blank=True,
+    )
+
+    blood_group = models.CharField(
+        max_length=10,
+    )
+
+    component_type = models.CharField(
+        max_length=100,
+    )
+
+    requested_units = models.PositiveIntegerField()
+
+    priority = models.CharField(
+        max_length=20,
+        choices=Priority.choices,
+        default=Priority.ROUTINE,
+    )
+
+    clinical_indication = models.TextField(
+        blank=True,
+    )
+
+    required_by = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    status = models.CharField(
+        max_length=30,
+        choices=Status.choices,
+        default=Status.PENDING,
+    )
+
+    requested_by = models.ForeignKey(
+        "accounts.User",
+        on_delete=models.PROTECT,
+        related_name="blood_requests_created",
+    )
+
+    reviewed_by = models.ForeignKey(
+        "accounts.User",
+        on_delete=models.PROTECT,
+        related_name="blood_requests_reviewed",
+        null=True,
+        blank=True,
+    )
+
+    reviewed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    notes = models.TextField(
+        blank=True,
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True,
+    )
+
+    def save(self, *args, **kwargs):
+
+        if not self.request_id:
+            self.request_id = (
+                f"REQ-{uuid.uuid4().hex[:12].upper()}"
+            )
+
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.request_id
+    
 class BloodIssue(models.Model):
 
     class IssueStatus(models.TextChoices):
@@ -304,12 +417,22 @@ class BloodTransfer(models.Model):
         auto_now_add=True,
     )
 
+    approved_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
     dispatched_at = models.DateTimeField(
         null=True,
         blank=True,
     )
 
     received_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    rejected_at = models.DateTimeField(
         null=True,
         blank=True,
     )
@@ -324,6 +447,42 @@ class BloodTransfer(models.Model):
         "accounts.User",
         on_delete=models.PROTECT,
         related_name="blood_transfers_requested",
+    )
+
+    approved_by = models.ForeignKey(
+        "accounts.User",
+        on_delete=models.PROTECT,
+        related_name="blood_transfers_approved",
+        null=True,
+        blank=True,
+    )
+
+    rejected_by = models.ForeignKey(
+        "accounts.User",
+        on_delete=models.PROTECT,
+        related_name="blood_transfers_rejected",
+        null=True,
+        blank=True,
+    )
+
+    dispatched_by = models.ForeignKey(
+        "accounts.User",
+        on_delete=models.PROTECT,
+        related_name="blood_transfers_dispatched",
+        null=True,
+        blank=True,
+    )
+
+    received_by = models.ForeignKey(
+        "accounts.User",
+        on_delete=models.PROTECT,
+        related_name="blood_transfers_received",
+        null=True,
+        blank=True,
+    )
+
+    rejection_reason = models.TextField(
+        blank=True,
     )
 
     notes = models.TextField(
@@ -616,3 +775,9 @@ class BloodStockAlert(models.Model):
             f"{self.component_type} - "
             f"{self.alert_level}"
         )
+
+
+from .models_clinical import (
+    BloodRequestFulfillment,
+    BloodRequestEvent,
+)

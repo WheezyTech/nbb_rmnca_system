@@ -1,4 +1,5 @@
 from django.contrib import admin
+from .models import BloodRequest
 
 from .models import (
     StorageLocation,
@@ -139,6 +140,47 @@ class BloodReservationAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+@admin.register(BloodRequest)
+class BloodRequestAdmin(admin.ModelAdmin):
+
+    list_display = (
+        "request_id",
+        "facility",
+        "patient_reference",
+        "blood_group",
+        "component_type",
+        "requested_units",
+        "priority",
+        "status",
+        "requested_by",
+        "created_at",
+    )
+
+    list_filter = (
+        "status",
+        "priority",
+        "blood_group",
+        "component_type",
+        "facility",
+    )
+
+    search_fields = (
+        "request_id",
+        "patient_reference",
+        "clinical_reference",
+    )
+
+    readonly_fields = (
+        "request_id",
+        "created_at",
+        "updated_at",
+        "reviewed_at",
+    )
+
+    ordering = (
+        "-created_at",
+    )
 
 
 @admin.register(BloodIssue)

@@ -8,6 +8,7 @@ from .models import (
     BloodTransfer,
     InventoryMovement,
     BloodStockAlert,
+    BloodRequest,
 )
 
 
@@ -134,6 +135,16 @@ class BloodIssueSerializer(serializers.ModelSerializer):
         read_only=True,
     )
 
+    blood_group = serializers.CharField(
+        source="inventory.blood_unit.blood_group",
+        read_only=True,
+    )
+
+    component_type = serializers.CharField(
+        source="inventory.blood_unit.component_type",
+        read_only=True,
+    )
+
     class Meta:
         model = BloodIssue
         fields = [
@@ -141,6 +152,8 @@ class BloodIssueSerializer(serializers.ModelSerializer):
             "issue_id",
             "inventory",
             "unit_id",
+            "blood_group",
+            "component_type",
             "facility",
             "patient_reference",
             "clinical_reference",
@@ -152,7 +165,13 @@ class BloodIssueSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id",
             "issue_id",
+            "unit_id",
+            "blood_group",
+            "component_type",
+            "facility",
             "issued_at",
+            "status",
+            "issued_by",
         ]
 
 
@@ -299,4 +318,73 @@ class BloodStockAlertSerializer(
 
         return obj.resolved_by.get_full_name() or (
             obj.resolved_by.username
+        )
+
+class BloodRequestSerializer(serializers.ModelSerializer):
+
+    facility_name = serializers.CharField(
+        source="facility.name",
+        read_only=True,
+    )
+
+    requested_by_name = serializers.SerializerMethodField()
+
+    reviewed_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BloodRequest
+
+        fields = [
+            "id",
+            "request_id",
+            "facility",
+            "facility_name",
+            "patient_reference",
+            "clinical_reference",
+            "blood_group",
+            "component_type",
+            "requested_units",
+            "priority",
+            "clinical_indication",
+            "required_by",
+            "status",
+            "requested_by",
+            "requested_by_name",
+            "reviewed_by",
+            "reviewed_by_name",
+            "reviewed_at",
+            "notes",
+            "created_at",
+            "updated_at",
+        ]
+
+        read_only_fields = [
+            "id",
+            "request_id",
+            "facility",
+            "facility_name",
+            "requested_by",
+            "requested_by_name",
+            "reviewed_by",
+            "reviewed_by_name",
+            "reviewed_at",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_requested_by_name(self, obj):
+
+        return (
+            obj.requested_by.get_full_name()
+            or obj.requested_by.username
+        )
+
+    def get_reviewed_by_name(self, obj):
+
+        if not obj.reviewed_by:
+            return None
+
+        return (
+            obj.reviewed_by.get_full_name()
+            or obj.reviewed_by.username
         )

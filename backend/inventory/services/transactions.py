@@ -43,7 +43,7 @@ def create_inventory_record(
                 defaults={
                     "facility": facility,
                     "storage_location": storage_location,
-                    "status": InventoryRecord.Status.QUARANTINED,
+                    "status": InventoryRecord.Status.AVAILABLE,
                 },
             )
         )
@@ -87,7 +87,7 @@ def release_inventory(
     )
 
     if inventory.status != (
-        InventoryRecord.Status.QUARANTINED
+        InventoryRecord.Status.AVAILABLE
     ):
         raise ValidationError(
             "Only quarantined blood units can be released."
@@ -305,6 +305,10 @@ def issue_blood(
     Issue a blood unit from inventory.
 
     The unit must be available or reserved.
+
+    If the unit is reserved for a blood request, the corresponding
+    reservation and blood request fulfillment are updated as part
+    of the same database transaction.
     """
 
     inventory = (
@@ -348,14 +352,63 @@ def issue_blood(
                 ]
             )
 
+            unit.status = "EXPIRED"
+
+            unit.save(
+                update_fields=["status"]
+            )
+
             raise ValidationError(
                 "This blood unit has expired and cannot be issued."
+            )
+
+    # Handle active reservation if the unit is reserved
+    reservation = None
+
+    if inventory.status == (
+        InventoryRecord.Status.RESERVED
+    ):
+
+        reservation = (
+            BloodReservation.objects
+            .select_for_update()
+            .filter(
+                inventory=inventory,
+                facility=facility,
+                status=BloodReservation.Status.ACTIVE,
+            )
+            .order_by("-reserved_at")
+            .first()
+        )
+
+        if reservation is None:
+            raise ValidationError(
+                "This blood unit is marked as reserved, "
+                "but no active reservation was found."
+            )
+
+        if (
+            reservation.patient_reference
+            and patient_reference
+            and reservation.patient_reference
+            != patient_reference
+        ):
+            raise ValidationError(
+                "Patient reference does not match the active "
+                "blood reservation."
             )
 
     issue = BloodIssue.objects.create(
         inventory=inventory,
         facility=facility,
-        patient_reference=patient_reference,
+        patient_reference=(
+            patient_reference
+            or (
+                reservation.patient_reference
+                if reservation
+                else ""
+            )
+        ),
         clinical_reference=clinical_reference,
         status=BloodIssue.IssueStatus.ISSUED,
         issued_by=issued_by,
@@ -378,6 +431,72 @@ def issue_blood(
     unit.save(
         update_fields=["status"]
     )
+
+    if reservation:
+
+        reservation.status = (
+            BloodReservation.Status.FULFILLED
+        )
+
+        reservation.save(
+            update_fields=["status"]
+        )
+
+    from inventory.models_clinical import (
+        BloodRequestFulfillment,
+        BloodRequestEvent,
+    )
+
+    fulfillment = (
+        BloodRequestFulfillment.objects
+        .select_for_update()
+        .select_related(
+            "blood_request",
+        )
+        .filter(
+            inventory=inventory,
+            status=BloodRequestFulfillment.Status.RESERVED,
+        )
+        .order_by("-created_at")
+        .first()
+    )
+
+    if fulfillment:
+
+        fulfillment.status = (
+            BloodRequestFulfillment.Status.ISSUED
+        )
+
+        fulfillment.save(
+            update_fields=[
+                "status",
+                "updated_at",
+            ]
+        )
+
+        BloodRequestEvent.objects.create(
+            blood_request=fulfillment.blood_request,
+            event_type=(
+                BloodRequestEvent.EventType.BLOOD_ISSUED
+            ),
+            performed_by=issued_by,
+            description=(
+                f"Blood unit {unit.unit_id} "
+                f"issued against request "
+                f"{fulfillment.blood_request.request_id}."
+            ),
+            metadata={
+                "inventory_id": inventory.inventory_id,
+                "unit_id": unit.unit_id,
+                "issue_id": issue.issue_id,
+                "fulfillment_id": fulfillment.fulfillment_id,
+                "reservation_id": (
+                    reservation.reservation_id
+                    if reservation
+                    else None
+                ),
+            },
+        )
 
     InventoryMovement.objects.create(
         inventory=inventory,
@@ -402,6 +521,10 @@ def return_blood(
 ):
     """
     Return an issued blood unit to available stock.
+
+    If the issue originated from a blood request fulfillment,
+    restore the related fulfillment and reservation so the
+    clinical request remains traceable.
     """
 
     issue = (
@@ -427,6 +550,7 @@ def return_blood(
     inventory = issue.inventory
     unit = inventory.blood_unit
 
+    # Check expiry before returning the unit to available stock.
     if unit.expiry_date:
         if unit.expiry_date <= timezone.now():
 
@@ -449,10 +573,17 @@ def return_blood(
                 update_fields=["status"]
             )
 
+            unit.status = "EXPIRED"
+
+            unit.save(
+                update_fields=["status"]
+            )
+
             raise ValidationError(
                 "The returned blood unit has expired."
             )
 
+    # Update issue
     issue.status = (
         BloodIssue.IssueStatus.RETURNED
     )
@@ -461,6 +592,7 @@ def return_blood(
         update_fields=["status"]
     )
 
+    # Return inventory to available stock
     inventory.status = (
         InventoryRecord.Status.AVAILABLE
     )
@@ -472,19 +604,112 @@ def return_blood(
         ]
     )
 
+    # Return blood unit to released status
     unit.status = "RELEASED"
 
     unit.save(
         update_fields=["status"]
     )
 
+    # Clinical blood-request reconciliation
+    from inventory.models_clinical import (
+        BloodRequestFulfillment,
+        BloodRequestEvent,
+    )
+
+    fulfillment = (
+        BloodRequestFulfillment.objects
+        .select_for_update()
+        .select_related(
+            "blood_request",
+        )
+        .filter(
+            inventory=inventory,
+            status=BloodRequestFulfillment.Status.ISSUED,
+        )
+        .order_by("-created_at")
+        .first()
+    )
+
+    reservation = None
+
+    if fulfillment:
+
+        reservation = (
+            BloodReservation.objects
+            .select_for_update()
+            .filter(
+                inventory=inventory,
+                facility=issue.facility,
+                status=BloodReservation.Status.FULFILLED,
+            )
+            .order_by("-reserved_at")
+            .first()
+        )
+
+        # Restore fulfillment to RESERVED
+        fulfillment.status = (
+            BloodRequestFulfillment.Status.RESERVED
+        )
+
+        fulfillment.save(
+            update_fields=[
+                "status",
+                "updated_at",
+            ]
+        )
+
+        # Restore the reservation to ACTIVE
+        if reservation:
+
+            reservation.status = (
+                BloodReservation.Status.ACTIVE
+            )
+
+            reservation.save(
+                update_fields=["status"]
+            )
+
+        # Create clinical audit event
+        BloodRequestEvent.objects.create(
+            blood_request=fulfillment.blood_request,
+            event_type=(
+                BloodRequestEvent.EventType.BLOOD_RETURNED
+            ),
+            performed_by=returned_by,
+            description=(
+                f"Blood unit {unit.unit_id} returned "
+                f"against request "
+                f"{fulfillment.blood_request.request_id}."
+            ),
+            metadata={
+                "inventory_id": inventory.inventory_id,
+                "unit_id": unit.unit_id,
+                "issue_id": issue.issue_id,
+                "fulfillment_id": fulfillment.fulfillment_id,
+                "reservation_id": (
+                    reservation.reservation_id
+                    if reservation
+                    else None
+                ),
+                "reason": (
+                    reason
+                    or "Blood unit returned to inventory."
+                ),
+            },
+        )
+
+    # Inventory audit
     InventoryMovement.objects.create(
         inventory=inventory,
         movement_type=(
             InventoryMovement.MovementType.RETURNED
         ),
         to_location=inventory.storage_location,
-        reason=reason or "Blood unit returned to inventory.",
+        reason=(
+            reason
+            or "Blood unit returned to inventory."
+        ),
         created_by=returned_by,
     )
 
@@ -594,7 +819,7 @@ def discard_blood(
     )
 
     allowed_statuses = [
-        InventoryRecord.Status.QUARANTINED,
+        InventoryRecord.Status.AVAILABLE,
         InventoryRecord.Status.AVAILABLE,
         InventoryRecord.Status.RESERVED,
         InventoryRecord.Status.EXPIRED,
@@ -718,7 +943,10 @@ def request_transfer(
             "Only available blood units can be requested for transfer."
         )
 
-    if inventory.blood_unit.expiry_date <= timezone.localdate():
+    if (
+        inventory.blood_unit.expiry_date
+        and inventory.blood_unit.expiry_date <= timezone.localdate()
+    ):
         raise ValidationError(
             "Expired blood cannot be transferred."
         )
@@ -796,13 +1024,25 @@ def approve_transfer(
             "The blood unit is no longer available for transfer."
         )
 
-    if inventory.blood_unit.expiry_date <= timezone.localdate():
+    if (
+        inventory.blood_unit.expiry_date
+        and inventory.blood_unit.expiry_date <= timezone.localdate()
+    ):
         raise ValidationError(
             "Expired blood cannot be transferred."
         )
 
     transfer.status = BloodTransfer.Status.APPROVED
-    transfer.save(update_fields=["status"])
+    transfer.approved_by = approved_by
+    transfer.approved_at = timezone.now()
+
+    transfer.save(
+        update_fields=[
+            "status",
+            "approved_by",
+            "approved_at",
+        ]
+    )
 
     InventoryMovement.objects.create(
         inventory=inventory,
@@ -864,7 +1104,10 @@ def dispatch_transfer(
             "The blood unit is no longer available for dispatch."
         )
 
-    if inventory.blood_unit.expiry_date <= timezone.localdate():
+    if (
+        inventory.blood_unit.expiry_date
+        and inventory.blood_unit.expiry_date <= timezone.localdate()
+    ):
         raise ValidationError(
             "Expired blood cannot be dispatched."
         )
@@ -876,10 +1119,12 @@ def dispatch_transfer(
 
     transfer.status = BloodTransfer.Status.DISPATCHED
     transfer.dispatched_at = timezone.now()
+    transfer.dispatched_by = dispatched_by
     transfer.save(
         update_fields=[
             "status",
             "dispatched_at",
+            "dispatched_by",
         ]
     )
 
@@ -903,8 +1148,6 @@ def receive_transfer(
 ):
     """
     Receive a dispatched blood unit at the destination facility.
-
-    The inventory is moved to the destination facility and becomes AVAILABLE.
     """
 
     transfer = (
@@ -921,6 +1164,22 @@ def receive_transfer(
     if transfer.status != BloodTransfer.Status.DISPATCHED:
         raise ValidationError(
             "Only dispatched transfers can be received."
+        )
+
+    if received_by.facility_id != transfer.to_facility_id:
+        raise ValidationError(
+            "Only a user assigned to the destination facility "
+            "can receive this transfer."
+        )
+
+    if storage_location is None:
+        raise ValidationError(
+            "A destination storage location is required."
+        )
+
+    if storage_location.facility_id != transfer.to_facility_id:
+        raise ValidationError(
+            "Storage location must belong to the destination facility."
         )
 
     inventory = (
@@ -944,19 +1203,27 @@ def receive_transfer(
             "Inventory source facility does not match the transfer."
         )
 
-    if inventory.blood_unit.expiry_date <= timezone.localdate():
-        raise ValidationError(
-            "This blood unit has expired and cannot be received as available stock."
+    if (
+        inventory.blood_unit.expiry_date
+        and inventory.blood_unit.expiry_date <= timezone.now()
+    ):
+        inventory.status = InventoryRecord.Status.EXPIRED
+
+        inventory.save(
+            update_fields=[
+                "status",
+                "updated_at",
+            ]
         )
 
-    if storage_location is None:
-        raise ValidationError(
-            "A destination storage location is required when receiving blood."
+        inventory.blood_unit.status = "EXPIRED"
+
+        inventory.blood_unit.save(
+            update_fields=["status"]
         )
 
-    if storage_location.facility_id != transfer.to_facility_id:
         raise ValidationError(
-            "Storage location must belong to the destination facility."
+            "This blood unit has expired and cannot be received."
         )
 
     source_location = inventory.storage_location
@@ -976,11 +1243,23 @@ def receive_transfer(
 
     transfer.status = BloodTransfer.Status.RECEIVED
     transfer.received_at = timezone.now()
+    transfer.received_by = received_by
 
     transfer.save(
         update_fields=[
             "status",
             "received_at",
+            "received_by",
+        ]
+    )
+
+    transfer.blood_unit.facility = transfer.to_facility
+    transfer.blood_unit.status = "RELEASED"
+
+    transfer.blood_unit.save(
+        update_fields=[
+            "facility",
+            "status",
         ]
     )
 
@@ -989,8 +1268,85 @@ def receive_transfer(
         movement_type=InventoryMovement.MovementType.MOVED,
         from_location=source_location,
         to_location=storage_location,
-        reason="Blood unit received at destination facility.",
+        reason=(
+            "Blood unit received at destination facility. "
+            f"Transfer: {transfer.transfer_id}"
+        ),
         created_by=received_by,
     )
+
+    return transfer
+
+@transaction.atomic
+def reject_transfer(
+    transfer_id,
+    rejected_by,
+    reason,
+):
+    """
+    Reject/cancel a requested blood transfer.
+    """
+
+    if not reason:
+        raise ValidationError(
+            "A rejection reason is required."
+        )
+
+    transfer = (
+        BloodTransfer.objects
+        .select_for_update()
+        .select_related(
+            "blood_unit",
+            "from_facility",
+            "to_facility",
+        )
+        .get(pk=transfer_id)
+    )
+
+    if transfer.status != BloodTransfer.Status.REQUESTED:
+        raise ValidationError(
+            "Only requested transfers can be rejected."
+        )
+
+    transfer.status = BloodTransfer.Status.CANCELLED
+    transfer.rejected_by = rejected_by
+    transfer.rejected_at = timezone.now()
+    transfer.rejection_reason = reason
+
+    transfer.save(
+        update_fields=[
+            "status",
+            "rejected_by",
+            "rejected_at",
+            "rejection_reason",
+        ]
+    )
+
+    inventory = (
+        InventoryRecord.objects
+        .filter(
+            blood_unit=transfer.blood_unit,
+        )
+        .select_related(
+            "storage_location",
+        )
+        .first()
+    )
+
+    if inventory:
+        InventoryMovement.objects.create(
+            inventory=inventory,
+            movement_type=(
+                InventoryMovement.MovementType.TRANSFERRED
+            ),
+            from_location=inventory.storage_location,
+            to_location=None,
+            reason=(
+                f"Blood transfer rejected. "
+                f"Transfer: {transfer.transfer_id}. "
+                f"Reason: {reason}"
+            ),
+            created_by=rejected_by,
+        )
 
     return transfer

@@ -9,6 +9,7 @@ from .views import (
     InventoryMovementViewSet,
     InventoryShortageViewSet,
     BloodStockAlertViewSet,
+    BloodRequestViewSet,
 )
 
 
@@ -67,6 +68,12 @@ router.register(
     "alerts",
     BloodStockAlertViewSet,
     basename="blood-stock-alert",
+)
+
+router.register(
+    "blood-requests",
+    BloodRequestViewSet,
+    basename="blood-request",
 )
 
 urlpatterns = router.urls
