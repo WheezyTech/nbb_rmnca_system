@@ -11,6 +11,7 @@ from .models import (
     BloodRequest,
 )
 
+from .models_clinical import TransfusionReaction
 
 class StorageLocationSerializer(serializers.ModelSerializer):
 
@@ -387,4 +388,118 @@ class BloodRequestSerializer(serializers.ModelSerializer):
         return (
             obj.reviewed_by.get_full_name()
             or obj.reviewed_by.username
+        )
+
+class TransfusionReactionSerializer(serializers.ModelSerializer):
+
+    reaction_type_display = serializers.CharField(
+        source="get_reaction_type_display",
+        read_only=True,
+    )
+
+    severity_display = serializers.CharField(
+        source="get_severity_display",
+        read_only=True,
+    )
+
+    status_display = serializers.CharField(
+        source="get_status_display",
+        read_only=True,
+    )
+
+    facility_name = serializers.CharField(
+        source="facility.name",
+        read_only=True,
+    )
+
+    issue_id = serializers.CharField(
+        source="blood_issue.issue_id",
+        read_only=True,
+    )
+
+    unit_id = serializers.CharField(
+        source="blood_issue.inventory.blood_unit.unit_id",
+        read_only=True,
+    )
+
+    blood_group = serializers.CharField(
+        source="blood_issue.inventory.blood_unit.blood_group",
+        read_only=True,
+    )
+
+    component_type = serializers.CharField(
+        source="blood_issue.inventory.blood_unit.component_type",
+        read_only=True,
+    )
+
+    reported_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TransfusionReaction
+
+        fields = [
+            "id",
+            "reaction_id",
+
+            "blood_issue",
+            "issue_id",
+            "unit_id",
+
+            "facility",
+            "facility_name",
+
+            "patient_reference",
+
+            "blood_group",
+            "component_type",
+
+            "reaction_type",
+            "reaction_type_display",
+
+            "severity",
+            "severity_display",
+
+            "status",
+            "status_display",
+
+            "symptoms",
+            "reaction_date",
+
+            "reported_by",
+            "reported_by_name",
+
+            "clinical_action",
+            "investigation_findings",
+            "laboratory_findings",
+            "outcome",
+            "notes",
+
+            "created_at",
+            "updated_at",
+        ]
+
+        read_only_fields = [
+            "id",
+            "reaction_id",
+
+            "facility",
+            "facility_name",
+
+            "issue_id",
+            "unit_id",
+            "blood_group",
+            "component_type",
+
+            "reported_by",
+            "reported_by_name",
+
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_reported_by_name(self, obj):
+
+        return (
+            obj.reported_by.get_full_name()
+            or obj.reported_by.username
         )
