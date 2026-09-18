@@ -10,6 +10,12 @@ from .views import (
     InventoryShortageViewSet,
     BloodStockAlertViewSet,
     BloodRequestViewSet,
+    TransfusionEventViewSet,
+    TransfusionReactionViewSet,
+    TransfusionReactionEventViewSet,
+    TransfusionReactionInvestigationViewSet,
+    HaemovigilanceReportViewSet,
+    NationalHaemovigilanceViewSet,
 )
 
 
@@ -74,6 +80,42 @@ router.register(
     "blood-requests",
     BloodRequestViewSet,
     basename="blood-request",
+)
+
+router.register(
+    "transfusion-reactions",
+    TransfusionReactionViewSet,
+    basename="transfusion-reaction",
+)
+
+router.register(
+    "transfusion-reaction-events",
+    TransfusionReactionEventViewSet,
+    basename="transfusion-reaction-event",
+)
+
+router.register(
+    "transfusion-reaction-investigations",
+    TransfusionReactionInvestigationViewSet,
+    basename="transfusion-reaction-investigation",
+)
+
+router.register(
+    "haemovigilance-reports",
+    HaemovigilanceReportViewSet,
+    basename="haemovigilance-report",
+)
+
+router.register(
+    "national-haemovigilance",
+    NationalHaemovigilanceViewSet,
+    basename="national-haemovigilance",
+)
+
+router.register(
+    "transfusion-events",
+    TransfusionEventViewSet,
+    basename="transfusion-event",
 )
 
 urlpatterns = router.urls

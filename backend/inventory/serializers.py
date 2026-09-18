@@ -11,7 +11,13 @@ from .models import (
     BloodRequest,
 )
 
-from .models_clinical import TransfusionReaction
+from .models_clinical import (
+    TransfusionReaction,
+    TransfusionReactionEvent,
+    TransfusionReactionInvestigation,
+    HaemovigilanceReport,
+    TransfusionEvent,
+)
 
 class StorageLocationSerializer(serializers.ModelSerializer):
 
@@ -502,4 +508,340 @@ class TransfusionReactionSerializer(serializers.ModelSerializer):
         return (
             obj.reported_by.get_full_name()
             or obj.reported_by.username
+        )
+
+class TransfusionReactionEventSerializer(serializers.ModelSerializer):
+
+    performed_by_name = serializers.SerializerMethodField()
+
+    event_type_display = serializers.CharField(
+        source="get_event_type_display",
+        read_only=True,
+    )
+
+    reaction_id = serializers.CharField(
+        source="reaction.reaction_id",
+        read_only=True,
+    )
+
+    class Meta:
+        model = TransfusionReactionEvent
+
+        fields = [
+            "id",
+            "event_id",
+            "reaction",
+            "reaction_id",
+            "event_type",
+            "event_type_display",
+            "performed_by",
+            "performed_by_name",
+            "previous_status",
+            "new_status",
+            "description",
+            "metadata",
+            "created_at",
+        ]
+
+        read_only_fields = [
+            "id",
+            "event_id",
+            "reaction",
+            "reaction_id",
+            "event_type",
+            "event_type_display",
+            "performed_by",
+            "performed_by_name",
+            "previous_status",
+            "new_status",
+            "description",
+            "metadata",
+            "created_at",
+        ]
+
+    def get_performed_by_name(self, obj):
+        return (
+            obj.performed_by.get_full_name()
+            or obj.performed_by.username
+        )
+
+class TransfusionReactionInvestigationSerializer(
+    serializers.ModelSerializer
+):
+
+    reaction_id = serializers.CharField(
+        source="reaction.reaction_id",
+        read_only=True,
+    )
+
+    investigator_name = serializers.SerializerMethodField()
+
+    investigation_type_display = serializers.CharField(
+        source="get_investigation_type_display",
+        read_only=True,
+    )
+
+    status_display = serializers.CharField(
+        source="get_status_display",
+        read_only=True,
+    )
+
+    class Meta:
+        model = TransfusionReactionInvestigation
+
+        fields = [
+            "id",
+            "investigation_id",
+
+            "reaction",
+            "reaction_id",
+
+            "investigation_type",
+            "investigation_type_display",
+
+            "status",
+            "status_display",
+
+            "investigator",
+            "investigator_name",
+
+            "investigation_started_at",
+            "completed_at",
+
+            "clinical_findings",
+            "laboratory_findings",
+            "investigation_conclusion",
+
+            "corrective_actions",
+            "preventive_actions",
+
+            "notes",
+
+            "created_at",
+            "updated_at",
+        ]
+
+        read_only_fields = [
+            "id",
+            "investigation_id",
+            "reaction_id",
+
+            "investigator",
+            "investigator_name",
+
+            "investigation_started_at",
+            "completed_at",
+
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_investigator_name(self, obj):
+        return (
+            obj.investigator.get_full_name()
+            or obj.investigator.username
+        )
+
+class HaemovigilanceReportSerializer(
+    serializers.ModelSerializer
+):
+
+    reaction_id = serializers.CharField(
+        source="reaction.reaction_id",
+        read_only=True,
+    )
+
+    facility_name = serializers.CharField(
+        source="facility.name",
+        read_only=True,
+    )
+
+    reporter_name = serializers.SerializerMethodField()
+
+    reviewed_by_name = serializers.SerializerMethodField()
+
+    report_type_display = serializers.CharField(
+        source="get_report_type_display",
+        read_only=True,
+    )
+
+    imputability_display = serializers.CharField(
+        source="get_imputability_display",
+        read_only=True,
+    )
+
+    outcome_display = serializers.CharField(
+        source="get_outcome_display",
+        read_only=True,
+    )
+
+    status_display = serializers.CharField(
+        source="get_status_display",
+        read_only=True,
+    )
+
+    class Meta:
+        model = HaemovigilanceReport
+
+        fields = [
+            "id",
+            "report_id",
+
+            "reaction",
+            "reaction_id",
+
+            "facility",
+            "facility_name",
+
+            "report_type",
+            "report_type_display",
+
+            "imputability",
+            "imputability_display",
+
+            "outcome",
+            "outcome_display",
+
+            "status",
+            "status_display",
+
+            "report_summary",
+
+            "clinical_findings",
+            "laboratory_findings",
+
+            "root_cause",
+
+            "corrective_actions",
+            "preventive_actions",
+
+            "reporter",
+            "reporter_name",
+
+            "submitted_at",
+
+            "reviewed_by",
+            "reviewed_by_name",
+
+            "reviewed_at",
+            "review_notes",
+
+            "created_at",
+            "updated_at",
+        ]
+
+        read_only_fields = [
+            "id",
+            "report_id",
+
+            "reaction_id",
+
+            "facility",
+            "facility_name",
+
+            "reporter",
+            "reporter_name",
+
+            "submitted_at",
+
+            "reviewed_by",
+            "reviewed_by_name",
+
+            "reviewed_at",
+
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_reporter_name(self, obj):
+        return (
+            obj.reporter.get_full_name()
+            or obj.reporter.username
+        )
+
+    def get_reviewed_by_name(self, obj):
+        if not obj.reviewed_by:
+            return None
+
+        return (
+            obj.reviewed_by.get_full_name()
+            or obj.reviewed_by.username
+        )
+
+class TransfusionEventSerializer(serializers.ModelSerializer):
+
+    facility_name = serializers.CharField(
+        source="facility.name",
+        read_only=True,
+    )
+
+    blood_group = serializers.CharField(
+        source="blood_issue.inventory.blood_unit.blood_group",
+        read_only=True,
+    )
+
+    component_type = serializers.CharField(
+        source="blood_issue.inventory.blood_unit.component_type",
+        read_only=True,
+    )
+
+    unit_id = serializers.CharField(
+        source="blood_issue.inventory.blood_unit.unit_id",
+        read_only=True,
+    )
+
+    recorded_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TransfusionEvent
+
+        fields = [
+            "id",
+            "transfusion_id",
+
+            "blood_issue",
+            "unit_id",
+            "blood_group",
+            "component_type",
+
+            "facility",
+            "facility_name",
+
+            "patient_reference",
+            "transfused_at",
+
+            "status",
+
+            "recorded_by",
+            "recorded_by_name",
+
+            "notes",
+
+            "created_at",
+            "updated_at",
+        ]
+
+        read_only_fields = [
+            "id",
+            "transfusion_id",
+
+            "facility",
+            "facility_name",
+
+            "unit_id",
+            "blood_group",
+            "component_type",
+
+            "recorded_by",
+            "recorded_by_name",
+
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_recorded_by_name(self, obj):
+
+        return (
+            obj.recorded_by.get_full_name()
+            or obj.recorded_by.username
         )

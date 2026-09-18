@@ -24,5 +24,9 @@ urlpatterns = [
         "api/inventory/",
         include("inventory.urls"),
     ),
-    
+
+    path(
+        "api/rmncah/",
+        include("rmncah.urls"),
+    ),
 ]

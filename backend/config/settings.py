@@ -42,7 +42,7 @@ INSTALLED_APPS = [
     "inventory",
     "blood_requests",
     "distribution",
-    "rmnca",
+    "rmncah",
     "reports",
     "notifications",
     "audit",

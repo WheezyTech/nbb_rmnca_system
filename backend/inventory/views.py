@@ -42,7 +42,16 @@ from .services.transfers import (
     request_transfer_from_recommendation,
 )
 
+from inventory.services.transfusion_reactions import transition_reaction
 from facilities.models import Facility
+
+from .models_clinical import (
+    TransfusionReaction,
+    TransfusionReactionEvent,
+    TransfusionReactionInvestigation,
+    HaemovigilanceReport,
+    TransfusionEvent,
+)
 
 from .models import (
     StorageLocation,
@@ -65,6 +74,11 @@ from .serializers import (
     InventoryTraceabilitySerializer,
     BloodStockAlertSerializer,
     BloodRequestSerializer,
+    TransfusionReactionSerializer,
+    TransfusionReactionEventSerializer,
+    TransfusionReactionInvestigationSerializer,
+    HaemovigilanceReportSerializer,
+    TransfusionEventSerializer,
 )
 
 from .services.alerts import (
@@ -76,6 +90,23 @@ from .services.alerts import (
 from .services.shortages import (
     get_zero_stock_by_facility,
     get_facility_shortage_ranking,
+)
+
+from inventory.services.haemovigilance import (
+    apply_haemovigilance_date_filter,
+    apply_haemovigilance_scope,
+    build_haemovigilance_aggregation,
+    get_haemovigilance_scope,
+    build_haemovigilance_time_trend,
+    build_reaction_time_trend,
+    build_county_reporting_summary,
+    build_serious_fatal_indicators,
+    build_component_analysis,
+    build_haemovigilance_rates,
+)
+
+from inventory.services.transfusions import (
+    record_transfusion,
 )
 
 class InventoryScopedMixin:
@@ -4444,3 +4475,1321 @@ class BloodRequestViewSet(
             ).data,
             status=status.HTTP_200_OK,
         )
+
+class TransfusionReactionViewSet(
+    InventoryScopedMixin,
+    viewsets.ModelViewSet,
+):
+    """
+    API for reporting and managing transfusion reactions.
+
+    Access is restricted to the user's facility scope.
+    """
+
+    queryset = TransfusionReaction.objects.select_related(
+        "blood_issue",
+        "blood_issue__inventory",
+        "blood_issue__inventory__blood_unit",
+        "facility",
+        "reported_by",
+    ).all()
+
+    serializer_class = TransfusionReactionSerializer
+    permission_classes = [IsAuthenticated]
+
+    # Reactions can be reported and updated during investigation.
+    # Delete is intentionally disabled for clinical traceability.
+    http_method_names = [
+        "get",
+        "post",
+        "patch",
+        "head",
+        "options",
+    ]
+
+    def get_queryset(self):
+        queryset = self.scoped_queryset(
+            super().get_queryset()
+        )
+
+        # Optional filters
+        status_filter = self.request.query_params.get("status")
+        severity = self.request.query_params.get("severity")
+        reaction_type = self.request.query_params.get("reaction_type")
+
+        if status_filter:
+            queryset = queryset.filter(
+                status=status_filter
+            )
+
+        if severity:
+            queryset = queryset.filter(
+                severity=severity
+            )
+
+        if reaction_type:
+            queryset = queryset.filter(
+                reaction_type=reaction_type
+            )
+
+        return queryset.order_by("-created_at")
+
+    def create(self, request, *args, **kwargs):
+        user = request.user
+
+        # A reaction must belong to a facility.
+        if not user.facility_id:
+            raise PermissionDenied(
+                "Your account is not assigned to a facility."
+            )
+
+        serializer = self.get_serializer(
+            data=request.data
+        )
+
+        serializer.is_valid(
+            raise_exception=True
+        )
+
+        blood_issue = serializer.validated_data[
+            "blood_issue"
+        ]
+
+        # The issue must belong to the same facility
+        # as the reporting user.
+        if blood_issue.facility_id != user.facility_id:
+            raise PermissionDenied(
+                "You cannot report a reaction for a blood issue "
+                "outside your facility."
+            )
+
+        # A reaction should only be reported against blood
+        # that has actually been issued/transfused.
+        if blood_issue.status not in [
+            BloodIssue.IssueStatus.ISSUED,
+            BloodIssue.IssueStatus.TRANSFUSED,
+        ]:
+            raise ValidationError(
+                "A transfusion reaction can only be reported "
+                "for blood that has been issued or transfused."
+            )
+
+        # Keep the reaction linked to the actual clinical issue.
+        patient_reference = serializer.validated_data.get(
+            "patient_reference"
+        )
+
+        if (
+            patient_reference
+            and patient_reference
+            != blood_issue.patient_reference
+        ):
+            raise ValidationError(
+                {
+                    "patient_reference": (
+                        "Patient reference does not match "
+                        "the blood issue."
+                    )
+                }
+            )
+
+        # If patient reference was omitted, inherit it from
+        # the blood issue.
+        if not patient_reference:
+            patient_reference = (
+                blood_issue.patient_reference
+            )
+
+        reaction = serializer.save(
+            facility=user.facility,
+            reported_by=user,
+            patient_reference=patient_reference,
+        )
+
+        output_serializer = self.get_serializer(
+            reaction
+        )
+
+        return Response(
+            output_serializer.data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="start-investigation",
+    )
+    def start_investigation(self, request, *args, **kwargs):
+        """
+        Move a reported reaction into investigation.
+        """
+
+        reaction = self.get_object()
+
+        notes = request.data.get("notes", "")
+
+        try:
+            reaction = transition_reaction(
+                reaction_id=reaction.pk,
+                new_status=TransfusionReaction.Status.UNDER_INVESTIGATION,
+                performed_by=request.user,
+                notes=notes,
+            )
+
+        except ValidationError as exc:
+            raise ValidationError(
+                {"detail": exc.message}
+            )
+
+        serializer = self.get_serializer(reaction)
+
+        return Response(
+            serializer.data,
+            status=status.HTTP_200_OK,
+        )
+
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="confirm",
+    )
+    def confirm_reaction(self, request, *args, **kwargs):
+        """
+        Confirm a transfusion reaction after investigation.
+        """
+
+        reaction = self.get_object()
+
+        notes = request.data.get("notes", "")
+
+        try:
+            reaction = transition_reaction(
+                reaction_id=reaction.pk,
+                new_status=TransfusionReaction.Status.CONFIRMED,
+                performed_by=request.user,
+                notes=notes,
+            )
+
+        except ValidationError as exc:
+            raise ValidationError(
+                {"detail": exc.message}
+            )
+
+        serializer = self.get_serializer(reaction)
+
+        return Response(
+            serializer.data,
+            status=status.HTTP_200_OK,
+        )
+
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="rule-out",
+    )
+    def rule_out_reaction(self, request, *args, **kwargs):
+        """
+        Rule out a suspected transfusion reaction after investigation.
+        """
+
+        reaction = self.get_object()
+
+        notes = request.data.get("notes", "")
+
+        try:
+            reaction = transition_reaction(
+                reaction_id=reaction.pk,
+                new_status=TransfusionReaction.Status.RULED_OUT,
+                performed_by=request.user,
+                notes=notes,
+            )
+
+        except ValidationError as exc:
+            raise ValidationError(
+                {"detail": exc.message}
+            )
+
+        serializer = self.get_serializer(reaction)
+
+        return Response(
+            serializer.data,
+            status=status.HTTP_200_OK,
+        )
+
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="close",
+    )
+    def close_reaction(self, request, *args, **kwargs):
+        """
+        Close a completed transfusion reaction investigation.
+        """
+
+        reaction = self.get_object()
+
+        notes = request.data.get("notes", "")
+
+        try:
+            reaction = transition_reaction(
+                reaction_id=reaction.pk,
+                new_status=TransfusionReaction.Status.CLOSED,
+                performed_by=request.user,
+                notes=notes,
+            )
+
+        except ValidationError as exc:
+            raise ValidationError(
+                {"detail": exc.message}
+            )
+
+        serializer = self.get_serializer(reaction)
+
+        return Response(
+            serializer.data,
+            status=status.HTTP_200_OK,
+        )
+
+class TransfusionReactionEventViewSet(
+    InventoryScopedMixin,
+    viewsets.ReadOnlyModelViewSet,
+):
+    """
+    Read-only audit history for transfusion reactions.
+
+    Events cannot be edited or deleted through the API.
+    """
+
+    queryset = TransfusionReactionEvent.objects.select_related(
+        "reaction",
+        "reaction__blood_issue",
+        "reaction__facility",
+        "performed_by",
+    ).all()
+
+    serializer_class = TransfusionReactionEventSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = self.scoped_queryset(
+            super().get_queryset()
+        )
+
+        reaction_id = self.request.query_params.get(
+            "reaction"
+        )
+
+        event_type = self.request.query_params.get(
+            "event_type"
+        )
+
+        if reaction_id:
+            queryset = queryset.filter(
+                reaction_id=reaction_id
+            )
+
+        if event_type:
+            queryset = queryset.filter(
+                event_type=event_type
+            )
+
+        return queryset.order_by("created_at")
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="events",
+    )
+    def events(self, request, *args, **kwargs):
+        """
+        Return the complete immutable audit history
+        for this transfusion reaction.
+        """
+
+        reaction = self.get_object()
+
+        events = (
+            TransfusionReactionEvent.objects
+            .filter(reaction=reaction)
+            .select_related("performed_by")
+            .order_by("created_at")
+        )
+
+        serializer = TransfusionReactionEventSerializer(
+            events,
+            many=True,
+        )
+
+        return Response(
+            serializer.data,
+            status=status.HTTP_200_OK,
+        )
+
+class TransfusionReactionInvestigationViewSet(
+    InventoryScopedMixin,
+    viewsets.ModelViewSet,
+):
+
+    queryset = (
+        TransfusionReactionInvestigation.objects
+        .select_related(
+            "reaction",
+            "reaction__facility",
+            "reaction__blood_issue",
+            "investigator",
+        )
+        .all()
+    )
+
+    serializer_class = (
+        TransfusionReactionInvestigationSerializer
+    )
+
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    http_method_names = [
+        "get",
+        "post",
+        "patch",
+        "head",
+        "options",
+    ]
+
+    def get_queryset(self):
+        queryset = self.scoped_queryset(
+            super().get_queryset()
+        )
+
+        investigation_type = (
+            self.request.query_params.get(
+                "investigation_type"
+            )
+        )
+
+        investigation_status = (
+            self.request.query_params.get(
+                "status"
+            )
+        )
+
+        reaction = (
+            self.request.query_params.get(
+                "reaction"
+            )
+        )
+
+        if investigation_type:
+            queryset = queryset.filter(
+                investigation_type=investigation_type
+            )
+
+        if investigation_status:
+            queryset = queryset.filter(
+                status=investigation_status
+            )
+
+        if reaction:
+            queryset = queryset.filter(
+                reaction_id=reaction
+            )
+
+        return queryset.order_by(
+            "-created_at"
+        )
+
+    def create(self, request, *args, **kwargs):
+
+        user = request.user
+
+        if not user.facility_id:
+            raise PermissionDenied(
+                "Your account is not assigned to a facility."
+            )
+
+        serializer = self.get_serializer(
+            data=request.data
+        )
+
+        serializer.is_valid(
+            raise_exception=True
+        )
+
+        reaction = serializer.validated_data[
+            "reaction"
+        ]
+
+        if reaction.facility_id != user.facility_id:
+            raise PermissionDenied(
+                "You cannot investigate a transfusion "
+                "reaction outside your facility."
+            )
+
+        investigation = serializer.save(
+            investigator=user,
+        )
+
+        output_serializer = self.get_serializer(
+            investigation
+        )
+
+        return Response(
+            output_serializer.data,
+            status=status.HTTP_201_CREATED,
+        )
+
+class HaemovigilanceReportViewSet(
+    InventoryScopedMixin,
+    viewsets.ModelViewSet,
+):
+
+    queryset = (
+        HaemovigilanceReport.objects
+        .select_related(
+            "reaction",
+            "reaction__blood_issue",
+            "reaction__facility",
+            "facility",
+            "reporter",
+            "reviewed_by",
+        )
+        .all()
+    )
+
+    serializer_class = HaemovigilanceReportSerializer
+
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    http_method_names = [
+        "get",
+        "post",
+        "patch",
+        "head",
+        "options",
+    ]
+
+    def get_queryset(self):
+        queryset = self.scoped_queryset(
+            super().get_queryset()
+        )
+
+        status_filter = (
+            self.request.query_params.get("status")
+        )
+
+        report_type = (
+            self.request.query_params.get("report_type")
+        )
+
+        imputability = (
+            self.request.query_params.get("imputability")
+        )
+
+        if status_filter:
+            queryset = queryset.filter(
+                status=status_filter
+            )
+
+        if report_type:
+            queryset = queryset.filter(
+                report_type=report_type
+            )
+
+        if imputability:
+            queryset = queryset.filter(
+                imputability=imputability
+            )
+
+        return queryset.order_by(
+            "-created_at"
+        )
+
+    def create(self, request, *args, **kwargs):
+
+        user = request.user
+
+        if not user.facility_id:
+            raise PermissionDenied(
+                "Your account is not assigned to a facility."
+            )
+
+        serializer = self.get_serializer(
+            data=request.data
+        )
+
+        serializer.is_valid(
+            raise_exception=True
+        )
+
+        reaction = serializer.validated_data[
+            "reaction"
+        ]
+
+        if reaction.facility_id != user.facility_id:
+            raise PermissionDenied(
+                "You cannot create a haemovigilance "
+                "report outside your facility."
+            )
+
+        if reaction.status == (
+            TransfusionReaction.Status.REPORTED
+        ):
+            raise ValidationError(
+                "The transfusion reaction must first "
+                "enter clinical investigation."
+            )
+
+        if hasattr(
+            reaction,
+            "haemovigilance_report",
+        ):
+            raise ValidationError(
+                "A haemovigilance report already exists "
+                "for this transfusion reaction."
+            )
+
+        report = serializer.save(
+            facility=user.facility,
+            reporter=user,
+        )
+
+        output_serializer = self.get_serializer(
+            report
+        )
+
+        return Response(
+            output_serializer.data,
+            status=status.HTTP_201_CREATED,
+        )
+
+class NationalHaemovigilanceViewSet(
+    viewsets.ViewSet,
+):
+
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    def _get_reports(self, request):
+
+        reports = (
+            HaemovigilanceReport.objects
+            .select_related(
+                "reaction",
+                "facility",
+                "facility__county",
+                "facility__county__region",
+                "reporter",
+                "reviewed_by",
+            )
+        )
+
+        # Geographical security
+        reports = apply_haemovigilance_scope(
+            reports,
+            request.user,
+        )
+
+        # Date filtering
+        reports = apply_haemovigilance_date_filter(
+            reports,
+            start_date=request.query_params.get(
+                "start_date"
+            ),
+            end_date=request.query_params.get(
+                "end_date"
+            ),
+        )
+
+        return reports
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="summary",
+    )
+    def summary(self, request):
+
+        reports = self._get_reports(request)
+
+        scope = get_haemovigilance_scope(
+            request.user
+        )
+
+        data = build_haemovigilance_aggregation(
+            reports=reports,
+            level=scope["level"],
+        )
+
+        data["filters"] = {
+            "start_date": request.query_params.get(
+                "start_date"
+            ),
+            "end_date": request.query_params.get(
+                "end_date"
+            ),
+        }
+
+        return Response(
+            data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="by-region",
+    )
+    def by_region(self, request):
+
+        reports = self._get_reports(request)
+
+        rows = (
+            reports
+            .values(
+                "facility__county__region_id",
+                "facility__county__region__name",
+            )
+            .annotate(
+                total_reports=Count("id")
+            )
+            .order_by(
+                "facility__county__region__name"
+            )
+        )
+
+        return Response(
+            {
+                "aggregation_level": "REGION",
+                "results": list(rows),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="by-county",
+    )
+    def by_county(self, request):
+
+        reports = self._get_reports(request)
+
+        rows = (
+            reports
+            .values(
+                "facility__county_id",
+                "facility__county__name",
+            )
+            .annotate(
+                total_reports=Count("id")
+            )
+            .order_by(
+                "facility__county__name"
+            )
+        )
+
+        return Response(
+            {
+                "aggregation_level": "COUNTY",
+                "results": list(rows),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="by-facility",
+    )
+    def by_facility(self, request):
+
+        reports = self._get_reports(request)
+
+        rows = (
+            reports
+            .values(
+                "facility_id",
+                "facility__name",
+                "facility__county__name",
+                "facility__county__region__name",
+            )
+            .annotate(
+                total_reports=Count("id")
+            )
+            .order_by(
+                "facility__name"
+            )
+        )
+
+        return Response(
+            {
+                "aggregation_level": "FACILITY",
+                "results": list(rows),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="drill-down",
+    )
+    def drill_down(self, request):
+
+        reports = self._get_reports(request)
+
+        region_id = request.query_params.get(
+            "region_id"
+        )
+
+        county_id = request.query_params.get(
+            "county_id"
+        )
+
+        facility_id = request.query_params.get(
+            "facility_id"
+        )
+
+        # -----------------------------------------------------
+        # Validate that IDs are integers
+        # -----------------------------------------------------
+
+        try:
+            if region_id:
+                region_id = int(region_id)
+
+            if county_id:
+                county_id = int(county_id)
+
+            if facility_id:
+                facility_id = int(facility_id)
+
+        except (TypeError, ValueError):
+            return Response(
+                {
+                    "detail": (
+                        "region_id, county_id and "
+                        "facility_id must be valid integers."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # -----------------------------------------------------
+        # Apply requested drill-down
+        # -----------------------------------------------------
+
+        if region_id:
+            reports = reports.filter(
+                facility__county__region_id=region_id
+            )
+
+        if county_id:
+            reports = reports.filter(
+                facility__county_id=county_id
+            )
+
+        if facility_id:
+            reports = reports.filter(
+                facility_id=facility_id
+            )
+
+        # -----------------------------------------------------
+        # Prevent invalid geographic combinations
+        # -----------------------------------------------------
+
+        if region_id and county_id:
+
+            county_exists = (
+                reports
+                .filter(
+                    facility__county__region_id=region_id,
+                    facility__county_id=county_id,
+                )
+                .exists()
+            )
+
+            if not county_exists:
+                return Response(
+                    {
+                        "detail": (
+                            "The selected county does not "
+                            "belong to the selected region "
+                            "or has no haemovigilance data "
+                            "within your permitted scope."
+                        )
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+        if county_id and facility_id:
+
+            facility_exists = (
+                reports
+                .filter(
+                    facility__county_id=county_id,
+                    facility_id=facility_id,
+                )
+                .exists()
+            )
+
+            if not facility_exists:
+                return Response(
+                    {
+                        "detail": (
+                            "The selected facility does not "
+                            "belong to the selected county "
+                            "or has no haemovigilance data "
+                            "within your permitted scope."
+                        )
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+        # -----------------------------------------------------
+        # Determine current drill-down level
+        # -----------------------------------------------------
+
+        if facility_id:
+            level = "FACILITY"
+
+        elif county_id:
+            level = "COUNTY"
+
+        elif region_id:
+            level = "REGION"
+
+        else:
+            level = "NATIONAL"
+
+        # -----------------------------------------------------
+        # Build aggregate statistics
+        # -----------------------------------------------------
+
+        data = build_haemovigilance_aggregation(
+            reports=reports,
+            level=level,
+        )
+
+        # -----------------------------------------------------
+        # Return selected geographic identifiers
+        # -----------------------------------------------------
+
+        data["selection"] = {
+            "region_id": region_id,
+            "county_id": county_id,
+            "facility_id": facility_id,
+        }
+
+        data["filters"] = {
+            "start_date": request.query_params.get(
+                "start_date"
+            ),
+            "end_date": request.query_params.get(
+                "end_date"
+            ),
+        }
+
+                # -----------------------------------------------------
+        # Geographic information
+        # -----------------------------------------------------
+
+        geographic = {}
+
+        if facility_id:
+
+            facility = (
+                reports
+                .filter(facility_id=facility_id)
+                .values(
+                    "facility_id",
+                    "facility__name",
+                    "facility__county_id",
+                    "facility__county__name",
+                    "facility__county__region_id",
+                    "facility__county__region__name",
+                )
+                .first()
+            )
+
+            if facility:
+                geographic = {
+                    "facility": {
+                        "id": facility["facility_id"],
+                        "name": facility[
+                            "facility__name"
+                        ],
+                    },
+                    "county": {
+                        "id": facility[
+                            "facility__county_id"
+                        ],
+                        "name": facility[
+                            "facility__county__name"
+                        ],
+                    },
+                    "region": {
+                        "id": facility[
+                            "facility__county__region_id"
+                        ],
+                        "name": facility[
+                            "facility__county__region__name"
+                        ],
+                    },
+                }
+
+        elif county_id:
+
+            county = (
+                reports
+                .filter(
+                    facility__county_id=county_id
+                )
+                .values(
+                    "facility__county_id",
+                    "facility__county__name",
+                    "facility__county__region_id",
+                    "facility__county__region__name",
+                )
+                .first()
+            )
+
+            if county:
+                geographic = {
+                    "county": {
+                        "id": county[
+                            "facility__county_id"
+                        ],
+                        "name": county[
+                            "facility__county__name"
+                        ],
+                    },
+                    "region": {
+                        "id": county[
+                            "facility__county__region_id"
+                        ],
+                        "name": county[
+                            "facility__county__region__name"
+                        ],
+                    },
+                }
+
+        elif region_id:
+
+            region = (
+                reports
+                .filter(
+                    facility__county__region_id=region_id
+                )
+                .values(
+                    "facility__county__region_id",
+                    "facility__county__region__name",
+                )
+                .first()
+            )
+
+            if region:
+                geographic = {
+                    "region": {
+                        "id": region[
+                            "facility__county__region_id"
+                        ],
+                        "name": region[
+                            "facility__county__region__name"
+                        ],
+                    }
+                }
+
+        data["geography"] = geographic
+
+        return Response(
+            data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="trends",
+    )
+    def trends(self, request):
+
+        period = request.query_params.get(
+            "period",
+            "monthly",
+        ).lower()
+
+        if period not in {
+            "monthly",
+            "quarterly",
+            "annual",
+        }:
+            return Response(
+                {
+                    "detail": (
+                        "period must be monthly, "
+                        "quarterly, or annual."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        reports = self._get_reports(request)
+
+        return Response(
+            {
+                "period": period,
+
+                "report_trend": (
+                    build_haemovigilance_time_trend(
+                        reports,
+                        period,
+                    )
+                ),
+
+                "reaction_trend": (
+                    build_reaction_time_trend(
+                        reports,
+                        period,
+                    )
+                ),
+
+                "filters": {
+                    "start_date": request.query_params.get(
+                        "start_date"
+                    ),
+                    "end_date": request.query_params.get(
+                        "end_date"
+                    ),
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="county-reporting",
+    )
+    def county_reporting(self, request):
+
+        reports = self._get_reports(request)
+
+        return Response(
+            {
+                "aggregation_level": "COUNTY",
+
+                "results": (
+                    build_county_reporting_summary(
+                        reports
+                    )
+                ),
+
+                "note": (
+                    "These are report counts. "
+                    "A true reporting rate requires "
+                    "a validated transfusion-event "
+                    "denominator."
+                ),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="serious-fatal",
+    )
+    def serious_fatal(self, request):
+
+        reports = self._get_reports(request)
+
+        indicators = (
+            build_serious_fatal_indicators(
+                reports
+            )
+        )
+
+        return Response(
+            {
+                "aggregation_level": (
+                    get_haemovigilance_scope(
+                        request.user
+                    )["level"]
+                ),
+
+                "indicators": indicators,
+
+                "filters": {
+                    "start_date": request.query_params.get(
+                        "start_date"
+                    ),
+                    "end_date": request.query_params.get(
+                        "end_date"
+                    ),
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="components",
+    )
+    def components(self, request):
+
+        reports = self._get_reports(request)
+
+        results = build_component_analysis(
+            reports
+        )
+
+        return Response(
+            {
+                "aggregation_level": (
+                    get_haemovigilance_scope(
+                        request.user
+                    )["level"]
+                ),
+
+                "results": results,
+
+                "filters": {
+                    "start_date": request.query_params.get(
+                        "start_date"
+                    ),
+                    "end_date": request.query_params.get(
+                        "end_date"
+                    ),
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="rates",
+    )
+    def rates(self, request):
+
+        reports = self._get_reports(request)
+
+        start_date = request.query_params.get(
+            "start_date"
+        )
+
+        end_date = request.query_params.get(
+            "end_date"
+        )
+
+        rates = build_haemovigilance_rates(
+            reports=reports,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        rates["aggregation_level"] = (
+            get_haemovigilance_scope(
+                request.user
+            )["level"]
+        )
+
+        rates["filters"] = {
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+
+        return Response(
+            rates,
+            status=status.HTTP_200_OK,
+        )
+
+class TransfusionEventViewSet(
+    InventoryScopedMixin,
+    viewsets.ModelViewSet,
+):
+
+    queryset = (
+        TransfusionEvent.objects
+        .select_related(
+            "blood_issue",
+            "blood_issue__inventory",
+            "blood_issue__inventory__blood_unit",
+            "facility",
+            "recorded_by",
+        )
+        .all()
+    )
+
+    serializer_class = TransfusionEventSerializer
+
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    http_method_names = [
+        "get",
+        "post",
+        "head",
+        "options",
+    ]
+
+    def get_queryset(self):
+
+        return self.scoped_queryset(
+            super().get_queryset()
+        )
+
+    def create(self, request, *args, **kwargs):
+
+        serializer = self.get_serializer(
+            data=request.data
+        )
+
+        serializer.is_valid(
+            raise_exception=True
+        )
+
+        user = request.user
+
+        if not user.facility_id:
+            raise PermissionDenied(
+                "Your account is not assigned "
+                "to a facility."
+            )
+
+        event = record_transfusion(
+            issue_id=serializer.validated_data[
+                "blood_issue"
+            ].pk,
+            recorded_by=user,
+            transfused_at=serializer.validated_data[
+                "transfused_at"
+            ],
+            patient_reference=serializer.validated_data.get(
+                "patient_reference",
+                "",
+            ),
+            notes=serializer.validated_data.get(
+                "notes",
+                "",
+            ),
+        )
+
+        output = self.get_serializer(event)
+
+        return Response(
+            output.data,
+            status=status.HTTP_201_CREATED,
+        )
+        
