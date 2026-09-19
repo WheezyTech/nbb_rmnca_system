@@ -19,6 +19,19 @@ from .views_anc import (
     ANCClinicalEventViewSet,
 )
 
+from .views_delivery import (
+    LabourRecordViewSet,
+    DeliveryRecordViewSet,
+    NewbornRecordViewSet,
+    PostnatalMotherRecordViewSet,
+)
+
+from .views_pnc import (
+    PNCVisitViewSet,
+    NewbornCareRecordViewSet,
+    PNCReferralViewSet,
+    PNCFollowUpViewSet,
+)
 
 router = DefaultRouter()
 
@@ -100,5 +113,52 @@ router.register(
     basename="anc-clinical-event",
 )
 
+router.register(
+    "labour",
+    LabourRecordViewSet,
+    basename="labour",
+)
+
+router.register(
+    "deliveries",
+    DeliveryRecordViewSet,
+    basename="delivery",
+)
+
+router.register(
+    "newborns",
+    NewbornRecordViewSet,
+    basename="newborn",
+)
+
+router.register(
+    "postnatal-mothers",
+    PostnatalMotherRecordViewSet,
+    basename="postnatal-mother",
+)
+
+router.register(
+    "pnc-visits",
+    PNCVisitViewSet,
+    basename="pnc-visit",
+)
+
+router.register(
+    "newborn-care",
+    NewbornCareRecordViewSet,
+    basename="newborn-care",
+)
+
+router.register(
+    "pnc-referrals",
+    PNCReferralViewSet,
+    basename="pnc-referral",
+)
+
+router.register(
+    "pnc-followups",
+    PNCFollowUpViewSet,
+    basename="pnc-followup",
+)
 
 urlpatterns = router.urls

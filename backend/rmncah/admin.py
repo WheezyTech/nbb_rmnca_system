@@ -20,6 +20,20 @@ from .models import (
     RMNCAHServicePoint,
 )
 
+from .models_pnc import (
+    PNCVisit,
+    NewbornCareRecord,
+    PNCReferral,
+    PNCFollowUp,
+)
+
+from .models_delivery import (
+    DeliveryRecord,
+    NewbornRecord,
+    LabourRecord,
+    PostnatalMotherRecord,
+)
+
 
 @admin.register(RMNCAHServiceCategory)
 class RMNCAHServiceCategoryAdmin(admin.ModelAdmin):
@@ -456,4 +470,270 @@ class ANCClinicalEventAdmin(admin.ModelAdmin):
     readonly_fields = (
         "event_id",
         "created_at",
+    )
+
+@admin.register(PNCVisit)
+class PNCVisitAdmin(admin.ModelAdmin):
+    list_display = (
+        "visit_id",
+        "pregnancy",
+        "facility",
+        "visit_type",
+        "visit_date",
+        "status",
+        "referral_required",
+    )
+
+    list_filter = (
+        "facility",
+        "visit_type",
+        "status",
+        "referral_required",
+    )
+
+    search_fields = (
+        "visit_id",
+        "pregnancy__pregnancy_id",
+    )
+
+    readonly_fields = (
+        "visit_id",
+        "created_at",
+        "updated_at",
+    )
+
+
+@admin.register(NewbornCareRecord)
+class NewbornCareRecordAdmin(admin.ModelAdmin):
+    list_display = (
+        "record_id",
+        "newborn",
+        "facility",
+        "assessment_date",
+        "status",
+        "referral_required",
+    )
+
+    list_filter = (
+        "facility",
+        "status",
+        "referral_required",
+        "jaundice_present",
+        "difficulty_breathing",
+        "fever",
+    )
+
+    search_fields = (
+        "record_id",
+        "newborn__newborn_id",
+    )
+
+    readonly_fields = (
+        "record_id",
+        "created_at",
+        "updated_at",
+    )
+
+
+@admin.register(PNCReferral)
+class PNCReferralAdmin(admin.ModelAdmin):
+    list_display = (
+        "referral_id",
+        "pregnancy",
+        "newborn",
+        "from_facility",
+        "to_facility",
+        "urgency",
+        "status",
+        "referred_at",
+    )
+
+    list_filter = (
+        "urgency",
+        "status",
+        "from_facility",
+        "to_facility",
+    )
+
+    search_fields = (
+        "referral_id",
+        "pregnancy__pregnancy_id",
+        "reason",
+    )
+
+    readonly_fields = (
+        "referral_id",
+        "referred_at",
+        "accepted_at",
+        "completed_at",
+    )
+
+
+@admin.register(PNCFollowUp)
+class PNCFollowUpAdmin(admin.ModelAdmin):
+    list_display = (
+        "followup_id",
+        "pregnancy",
+        "newborn",
+        "facility",
+        "followup_type",
+        "scheduled_date",
+        "status",
+    )
+
+    list_filter = (
+        "facility",
+        "followup_type",
+        "status",
+    )
+
+    search_fields = (
+        "followup_id",
+        "pregnancy__pregnancy_id",
+        "newborn__newborn_id",
+    )
+
+    readonly_fields = (
+        "followup_id",
+        "created_at",
+        "updated_at",
+        "completed_at",
+    )
+
+@admin.register(LabourRecord)
+class LabourRecordAdmin(admin.ModelAdmin):
+    list_display = (
+        "labour_id",
+        "pregnancy",
+        "facility",
+        "admission_date",
+        "status",
+        "managed_by",
+    )
+
+    list_filter = (
+        "facility",
+        "status",
+        "membrane_status",
+    )
+
+    search_fields = (
+        "labour_id",
+        "pregnancy__pregnancy_id",
+    )
+
+    readonly_fields = (
+        "labour_id",
+        "created_at",
+        "updated_at",
+    )
+
+
+@admin.register(DeliveryRecord)
+class DeliveryRecordAdmin(admin.ModelAdmin):
+    list_display = (
+        "delivery_id",
+        "pregnancy",
+        "facility",
+        "delivery_date",
+        "delivery_mode",
+        "delivery_status",
+        "gestational_age_weeks",
+        "number_of_babies",
+        "attended_by",
+    )
+
+    list_filter = (
+        "facility",
+        "delivery_mode",
+        "delivery_status",
+        "placenta_complete",
+    )
+
+    search_fields = (
+        "delivery_id",
+        "pregnancy__pregnancy_id",
+        "pregnancy__client__patient_reference",
+    )
+
+    readonly_fields = (
+        "delivery_id",
+        "created_at",
+        "updated_at",
+    )
+
+
+@admin.register(NewbornRecord)
+class NewbornRecordAdmin(admin.ModelAdmin):
+    list_display = (
+        "newborn_id",
+        "delivery",
+        "pregnancy",
+        "facility",
+        "birth_order",
+        "sex",
+        "date_time_of_birth",
+        "birth_weight_kg",
+        "condition",
+        "status",
+        "transferred_to_nicu",
+        "recorded_by",
+    )
+
+    list_filter = (
+        "facility",
+        "sex",
+        "condition",
+        "status",
+        "resuscitation_required",
+        "transferred_to_nicu",
+    )
+
+    search_fields = (
+        "newborn_id",
+        "delivery__delivery_id",
+        "pregnancy__pregnancy_id",
+    )
+
+    readonly_fields = (
+        "newborn_id",
+        "created_at",
+        "updated_at",
+    )
+
+
+@admin.register(PostnatalMotherRecord)
+class PostnatalMotherRecordAdmin(admin.ModelAdmin):
+    list_display = (
+        "postnatal_id",
+        "pregnancy",
+        "delivery",
+        "facility",
+        "assessment_date",
+        "days_after_delivery",
+        "status",
+        "breastfeeding_status",
+        "reviewed_by",
+    )
+
+    list_filter = (
+        "facility",
+        "status",
+        "bleeding",
+        "fever",
+        "breast_condition",
+        "wound_condition",
+        "breastfeeding_status",
+    )
+
+    search_fields = (
+        "postnatal_id",
+        "pregnancy__pregnancy_id",
+        "delivery__delivery_id",
+    )
+
+    readonly_fields = (
+        "postnatal_id",
+        "created_at",
+        "updated_at",
     )

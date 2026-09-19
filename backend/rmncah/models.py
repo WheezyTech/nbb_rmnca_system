@@ -578,3 +578,27 @@ class RMNCAHFacilityService(models.Model):
 
     def __str__(self):
         return f"{self.facility.name} - {self.service.name}"
+    
+from .models_anc import (
+    ANCClient,
+    PregnancyRecord,
+    ANCVisit,
+    ANCRiskAssessment,
+    ANCInvestigation,
+    ANCReferral,
+    ANCClinicalEvent,
+)
+
+from .models_delivery import (
+    DeliveryRecord,
+    NewbornRecord,
+    LabourRecord,
+    PostnatalMotherRecord,
+)
+
+from .models_pnc import (
+    PNCVisit,
+    NewbornCareRecord,
+    PNCReferral,
+    PNCFollowUp,
+)
